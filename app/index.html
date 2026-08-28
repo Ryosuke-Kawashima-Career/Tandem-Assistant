@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EchoSphere — Tandem Co-Teacher</title>
+  <link rel="stylesheet" href="./src/styles/main.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌐</text></svg>">
+</head>
+<body class="macos-canvas-grid">
+  <div id="app">
+    <!-- 1. macOS Window Header -->
+    <header class="macos-window-header">
+      <div class="macos-traffic-lights">
+        <span class="traffic-light traffic-close" title="Close"></span>
+        <span class="traffic-light traffic-minimize" title="Minimize"></span>
+        <span class="traffic-light traffic-zoom" title="Zoom"></span>
+      </div>
+
+      <div class="macos-header-title">
+        <span>🌐 EchoSphere</span>
+        <span style="font-weight: 400; color: var(--macos-text-secondary);">—</span>
+        <span>Tandem Co-Teacher</span>
+        <span class="macos-badge-pill" id="room-badge">📡 Channel: tokyo-mumbai-101</span>
+      </div>
+
+      <div class="macos-header-status">
+        <div class="macos-segmented-control" id="role-switcher">
+          <button class="macos-segmented-btn active" data-role="student">👩‍🎓 Student View</button>
+          <button class="macos-segmented-btn" data-role="teacher">👨‍🏫 Teacher Oversight</button>
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px;">
+          <span class="status-dot" id="connection-dot"></span>
+          <span class="status-text" id="connection-status">SD-RTN™ Ready</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- 2. macOS Floating Pill Toolbar -->
+    <div class="macos-toolbar-container">
+      <div class="macos-pill-toolbar">
+        <button class="macos-action-btn primary" id="btn-join">
+          <span id="btn-join-icon">📞</span>
+          <span id="btn-join-text">Join Channel</span>
+        </button>
+
+        <button class="macos-action-btn" id="btn-mic" disabled>
+          <span id="btn-mic-icon">🎙️</span>
+          <span id="btn-mic-text">Mute Mic</span>
+        </button>
+
+        <div style="width: 1px; height: 18px; background: var(--macos-border-subtle); margin: 0 4px;"></div>
+
+        <button class="macos-action-btn" id="btn-simulation" title="Run realistic tri-lingual dialogue simulation">
+          <span>✨</span>
+          <span>Simulate Tandem Dialogue</span>
+        </button>
+
+        <button class="macos-action-btn" id="btn-clear" title="Clear all subtitles and scaffolding">
+          <span>🗑️</span>
+          <span>Clear Feed</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 3. Main 3-Column macOS Workspace -->
+    <main class="macos-workspace-grid">
+      <!-- Left Column: Peer Learners & Dynamics -->
+      <section class="macos-card-panel" id="panel-peers">
+        <div class="macos-panel-header">
+          <span class="macos-panel-title">👥 Tandem Breakout</span>
+          <span class="macos-badge-pill" style="font-size: 10px;">2 Active Peers</span>
+        </div>
+        <div class="macos-panel-content">
+          <!-- Peer 1: Kenji -->
+          <div class="peer-card">
+            <div class="peer-avatar">
+              <span>🧑‍🎓</span>
+              <span class="peer-online-dot"></span>
+            </div>
+            <div class="peer-info">
+              <div class="peer-name">Kenji Sato 🇯🇵</div>
+              <div class="peer-role">Native: Japanese • Learning: Hindi / EN</div>
+            </div>
+          </div>
+
+          <!-- Peer 2: Aarav -->
+          <div class="peer-card">
+            <div class="peer-avatar">
+              <span>👨‍🎓</span>
+              <span class="peer-online-dot"></span>
+            </div>
+            <div class="peer-info">
+              <div class="peer-name">Aarav Sharma 🇮🇳</div>
+              <div class="peer-role">Native: Hindi • Learning: Japanese / EN</div>
+            </div>
+          </div>
+
+          <!-- Speaking Balance Gauge -->
+          <div class="speaking-balance-container">
+            <div class="balance-header">
+              <span>Speaking Balance</span>
+              <span id="balance-status" style="font-size: 11px; color: var(--macos-accent-green); font-weight: 600;">⚖️ Optimal Parity</span>
+            </div>
+            <div class="balance-progress-bar">
+              <div class="balance-seg-a" id="balance-seg-a" style="width: 50%;"></div>
+              <div class="balance-seg-b" id="balance-seg-b" style="width: 50%;"></div>
+            </div>
+            <div class="balance-legend">
+              <span id="balance-label-a">Kenji: 50%</span>
+              <span id="balance-label-b">Aarav: 50%</span>
+            </div>
+          </div>
+
+          <!-- Active Conversational Topic -->
+          <div class="topic-card">
+            <div class="topic-tag">🎯 Active Conversation Topic</div>
+            <div class="topic-title" id="topic-title">Festivals & Food in India and Japan</div>
+            <div class="topic-prompt" id="topic-prompt">What traditional dish do you prepare for Diwali or Oshogatsu? Compare how your family celebrates.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Center Column: Live Subtitles Stream -->
+      <section class="macos-card-panel" id="panel-subtitles">
+        <div class="macos-panel-header">
+          <span class="macos-panel-title">💬 Live Tri-Lingual Subtitles</span>
+          <div style="display: flex; gap: 6px;">
+            <span class="lang-flag-pill">🇯🇵 JA</span>
+            <span class="lang-flag-pill">🇮🇳 HI</span>
+            <span class="lang-flag-pill">🇬🇧 EN</span>
+          </div>
+        </div>
+        <div class="macos-panel-content" id="subtitles-container">
+          <!-- Initial Welcome Card -->
+          <div class="subtitle-entry ai-mediator">
+            <div class="subtitle-header">
+              <div class="subtitle-speaker-badge">
+                <span>🤖</span>
+                <span>EchoSphere AI Co-Teacher</span>
+              </div>
+              <div class="subtitle-timestamp">Just now</div>
+            </div>
+            <div class="subtitle-original-text">Welcome to your Tandem session! Speak naturally in Hindi, Japanese, or English. I'll provide live Romaji transliteration, cultural idiom scaffolding, and conversational prompts.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Column: AI Co-Teacher Scaffolding -->
+      <section class="macos-card-panel" id="panel-scaffolding">
+        <div class="macos-panel-header">
+          <span class="macos-panel-title">✨ AI Pedagogical Insights</span>
+          <span class="macos-badge-pill" style="background: rgba(52, 199, 89, 0.1); color: var(--macos-accent-green); border-color: rgba(52, 199, 89, 0.2);">Live Assist</span>
+        </div>
+        <div class="macos-panel-content" id="scaffolding-container">
+          <!-- Placeholder Card -->
+          <div class="idiom-bubble" id="initial-idiom-hint">
+            <div class="idiom-badge">✨ Ready to Assist</div>
+            <div class="idiom-phrase">一期一会 (Ichigo Ichie)</div>
+            <div class="idiom-romaji">🔤 Ichigo ichie</div>
+            <div class="idiom-meaning">"Once-in-a-lifetime encounter / Treasure every meeting"</div>
+            <div class="idiom-cultural-note">💡 A four-character idiom (Yojijukugo) rooted in Japanese tea ceremony philosophy reminding participants to cherish every conversation.</div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- 4. Teacher Oversight Floating Dock (Controlled via Segmented Switcher) -->
+    <footer class="teacher-dock hidden" id="teacher-oversight-dock">
+      <div class="teacher-alert-banner">
+        <span class="teacher-alert-pill warning" id="teacher-alert-pill">ALERT</span>
+        <span id="teacher-alert-text">Monitoring Room 101. AI co-teacher is active in ambient mode.</span>
+      </div>
+
+      <div class="teacher-actions-group">
+        <button class="macos-action-btn" data-teacher-action="break_silence" title="Inject an engaging prompt to revive dialogue">
+          <span>🎯</span>
+          <span>Break Silence</span>
+        </button>
+        <button class="macos-action-btn" data-teacher-action="nudge_turn" title="Encourage the quieter student to speak">
+          <span>⚡</span>
+          <span>Nudge Turn</span>
+        </button>
+        <button class="macos-action-btn" data-teacher-action="quiz" title="Dispatch instant interactive comprehension quiz">
+          <span>📝</span>
+          <span>Send Quiz</span>
+        </button>
+        <button class="macos-action-btn" data-teacher-action="praise" title="Send positive reinforcement to both learners">
+          <span>👏</span>
+          <span>Praise</span>
+        </button>
+      </div>
+    </footer>
+  </div>
+
+  <!-- Main Application Script -->
+  <script type="module" src="./src/app.js"></script>
+</body>
+</html>

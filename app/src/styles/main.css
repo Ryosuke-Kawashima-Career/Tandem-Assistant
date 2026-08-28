@@ -1,0 +1,903 @@
+/**
+ * Summary:
+ *   main.css implements the macOS Light Theme design system for EchoSphere Tandem Co-Teacher.
+ *   It features liquid acrylic glassmorphism, floating pill capsule toolbars,
+ *   subtle micro-borders with top specular inner glows, macOS traffic lights,
+ *   and smooth tactile spring animations.
+ *
+ * Structure:
+ *   1. CSS Variables & Design Tokens (macOS Light & Dark Themes)
+ *   2. Base & Reset Styles with macOS Canvas Dot Grid
+ *   3. macOS Window Header & Traffic Light Controls
+ *   4. Floating Pill Capsule Toolbars & Segmented Controls
+ *   5. 3-Column macOS Frosted Workspace Layout
+ *   6. Subtitle Speech Bubble Cards & Transliteration Pills
+ *   7. Idiom Card & Cultural Context Scaffolding Popovers
+ *   8. Speaking Balance Gauge & Topic Prompts
+ *   9. Interactive Quiz Cards & Teacher Oversight Floating Dock
+ *   10. Tactile Keyframes & Animation Primitives
+ */
+
+/* ==========================================================================
+   1. Design Tokens & CSS Variables
+   ========================================================================== */
+:root {
+  /* System Font Stacks */
+  --macos-font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --macos-font-mono: "SF Mono", "Fira Code", Menlo, Monaco, Consolas, monospace;
+
+  /* macOS Light Theme Palette */
+  --macos-bg-base: #f5f5f7;
+  --macos-bg-canvas: #ffffff;
+  --macos-surface-acrylic: rgba(255, 255, 255, 0.78);
+  --macos-surface-card: rgba(255, 255, 255, 0.88);
+  --macos-surface-overlay: rgba(255, 255, 255, 0.94);
+  --macos-surface-hover: rgba(0, 0, 0, 0.05);
+  --macos-surface-active: rgba(0, 0, 0, 0.09);
+  --macos-surface-selected: rgba(0, 122, 255, 0.12);
+
+  /* Micro-Borders & Specular Highlights */
+  --macos-border-subtle: rgba(0, 0, 0, 0.08);
+  --macos-border-highlight: rgba(0, 0, 0, 0.12);
+  --macos-border-focus: #007aff;
+  --macos-inner-glow: inset 0 1px 1px 0 rgba(255, 255, 255, 0.85);
+  --macos-inner-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.04);
+
+  /* Accent Colors */
+  --macos-accent-blue: #007aff;
+  --macos-accent-blue-hover: #0066d6;
+  --macos-accent-green: #34c759;
+  --macos-accent-purple: #af52de;
+  --macos-accent-indigo: #5856d6;
+  --macos-accent-teal: #30b0c7;
+  --macos-accent-orange: #ff9500;
+  --macos-accent-red: #ff3b30;
+
+  /* macOS Traffic Light Buttons */
+  --macos-traffic-close: #ff5f56;
+  --macos-traffic-minimize: #ffbd2e;
+  --macos-traffic-zoom: #27c93f;
+
+  /* Typography Colors */
+  --macos-text-primary: #1d1d1f;
+  --macos-text-secondary: rgba(60, 60, 67, 0.75);
+  --macos-text-tertiary: rgba(60, 60, 67, 0.48);
+  --macos-text-placeholder: rgba(60, 60, 67, 0.35);
+
+  /* Backdrop Blur Intensities */
+  --macos-blur-dock: blur(28px) saturate(180%);
+  --macos-blur-sheet: blur(36px) saturate(190%);
+  --macos-blur-card: blur(20px) saturate(170%);
+
+  /* Ambient Diffuse Shadow Elevations */
+  --macos-shadow-dock: 0 12px 36px rgba(0, 0, 0, 0.08), 0 2px 6px rgba(0, 0, 0, 0.04);
+  --macos-shadow-modal: 0 24px 60px rgba(0, 0, 0, 0.12), 0 4px 14px rgba(0, 0, 0, 0.06);
+  --macos-shadow-card: 0 4px 20px rgba(0, 0, 0, 0.05), 0 1px 3px rgba(0, 0, 0, 0.03);
+  --macos-shadow-button: 0 1px 2px rgba(0, 0, 0, 0.06), 0 0 0 1px rgba(0, 0, 0, 0.04);
+  --macos-shadow-pill: 0 2px 8px rgba(0, 0, 0, 0.06);
+
+  /* Tactile Spring Timing */
+  --macos-ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+  --macos-ease-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --macos-duration-fast: 150ms;
+  --macos-duration-normal: 260ms;
+
+  /* Canvas Dot Grid */
+  --macos-grid-dot: rgba(0, 0, 0, 0.06);
+}
+
+/* ==========================================================================
+   2. Base Styles & Canvas Background
+   ========================================================================== */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--macos-font-sans);
+  color: var(--macos-text-primary);
+  background-color: var(--macos-bg-base);
+  background-image: radial-gradient(var(--macos-grid-dot) 1.2px, transparent 1.2px);
+  background-size: 24px 24px;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow-x: hidden;
+  user-select: none;
+}
+
+/* App Container */
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  max-width: 1600px;
+  margin: 0 auto;
+  width: 100%;
+  padding: 16px 24px 24px 24px;
+  gap: 16px;
+}
+
+/* ==========================================================================
+   3. macOS Window Header & Traffic Lights
+   ========================================================================== */
+.macos-window-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--macos-surface-acrylic);
+  backdrop-filter: var(--macos-blur-dock);
+  -webkit-backdrop-filter: var(--macos-blur-dock);
+  border: 1px solid var(--macos-border-subtle);
+  border-radius: 16px;
+  padding: 10px 18px;
+  box-shadow: var(--macos-shadow-card), var(--macos-inner-glow);
+  flex-shrink: 0;
+}
+
+.macos-traffic-lights {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.traffic-light {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  display: inline-block;
+  cursor: pointer;
+  transition: transform var(--macos-duration-fast) var(--macos-ease-spring);
+}
+
+.traffic-light:hover {
+  transform: scale(1.15);
+}
+
+.traffic-close {
+  background-color: var(--macos-traffic-close);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+
+.traffic-minimize {
+  background-color: var(--macos-traffic-minimize);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+
+.traffic-zoom {
+  background-color: var(--macos-traffic-zoom);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.12);
+}
+
+.macos-header-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--macos-text-primary);
+  letter-spacing: -0.01em;
+}
+
+.macos-badge-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 3px 10px;
+  border-radius: 9999px;
+  background: rgba(0, 122, 255, 0.1);
+  color: var(--macos-accent-blue);
+  border: 1px solid rgba(0, 122, 255, 0.2);
+}
+
+.macos-header-status {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--macos-accent-green);
+  display: inline-block;
+  animation: macos-pulse 2s infinite ease-in-out;
+}
+
+.status-text {
+  font-size: 12px;
+  color: var(--macos-text-secondary);
+  font-weight: 500;
+}
+
+/* ==========================================================================
+   4. Floating Pill Capsule Toolbars & Segmented Controls
+   ========================================================================== */
+.macos-toolbar-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.macos-pill-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--macos-surface-acrylic);
+  backdrop-filter: var(--macos-blur-dock);
+  -webkit-backdrop-filter: var(--macos-blur-dock);
+  border: 1px solid var(--macos-border-subtle);
+  border-radius: 9999px;
+  box-shadow: var(--macos-shadow-dock), var(--macos-inner-glow);
+}
+
+.macos-segmented-control {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 3px;
+  border-radius: 9999px;
+  border: 1px solid var(--macos-border-subtle);
+}
+
+.macos-segmented-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 9999px;
+  background: transparent;
+  color: var(--macos-text-secondary);
+  border: none;
+  font-family: var(--macos-font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--macos-duration-fast) var(--macos-ease-spring);
+}
+
+.macos-segmented-btn:hover {
+  background: var(--macos-surface-hover);
+  color: var(--macos-text-primary);
+}
+
+.macos-segmented-btn.active {
+  background: #ffffff;
+  color: var(--macos-text-primary);
+  box-shadow: var(--macos-shadow-button), 0 1px 3px rgba(0, 0, 0, 0.08);
+  font-weight: 600;
+}
+
+.macos-segmented-btn:active {
+  transform: scale(0.96);
+}
+
+.macos-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: 9999px;
+  background: var(--macos-bg-canvas);
+  color: var(--macos-text-primary);
+  border: 1px solid var(--macos-border-subtle);
+  font-family: var(--macos-font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: var(--macos-shadow-button), var(--macos-inner-glow);
+  transition: all var(--macos-duration-fast) var(--macos-ease-spring);
+}
+
+.macos-action-btn:hover {
+  background: #ffffff;
+  border-color: var(--macos-border-highlight);
+  box-shadow: var(--macos-shadow-card);
+  transform: translateY(-1px);
+}
+
+.macos-action-btn:active {
+  transform: scale(0.96) translateY(0);
+}
+
+.macos-action-btn.primary {
+  background: var(--macos-accent-blue);
+  color: #ffffff;
+  border-color: transparent;
+  box-shadow: 0 2px 8px rgba(0, 122, 255, 0.25);
+}
+
+.macos-action-btn.primary:hover {
+  background: var(--macos-accent-blue-hover);
+}
+
+.macos-action-btn.danger {
+  background: rgba(255, 59, 48, 0.1);
+  color: var(--macos-accent-red);
+  border-color: rgba(255, 59, 48, 0.2);
+}
+
+.macos-action-btn.danger:hover {
+  background: var(--macos-accent-red);
+  color: #ffffff;
+}
+
+/* ==========================================================================
+   5. 3-Column macOS Frosted Workspace Layout
+   ========================================================================== */
+.macos-workspace-grid {
+  display: grid;
+  grid-template-columns: 320px 1fr 340px;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+@media (max-width: 1200px) {
+  .macos-workspace-grid {
+    grid-template-columns: 280px 1fr 300px;
+  }
+}
+
+@media (max-width: 960px) {
+  .macos-workspace-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Column Panel Card Base */
+.macos-card-panel {
+  background: var(--macos-surface-card);
+  backdrop-filter: var(--macos-blur-card);
+  -webkit-backdrop-filter: var(--macos-blur-card);
+  border: 1px solid var(--macos-border-subtle);
+  border-radius: 18px;
+  box-shadow: var(--macos-shadow-card), var(--macos-inner-glow);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  position: relative;
+}
+
+.macos-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--macos-border-subtle);
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.macos-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--macos-text-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.macos-panel-content {
+  padding: 16px;
+  overflow-y: auto;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* Custom macOS Scrollbars */
+.macos-panel-content::-webkit-scrollbar {
+  width: 6px;
+}
+.macos-panel-content::-webkit-scrollbar-track {
+  background: transparent;
+}
+.macos-panel-content::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 3px;
+}
+.macos-panel-content::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* ==========================================================================
+   6. Left Panel: Peer Learners & Topic Widget
+   ========================================================================== */
+.peer-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid var(--macos-border-subtle);
+  border-radius: 14px;
+  padding: 12px 14px;
+  transition: transform var(--macos-duration-fast) var(--macos-ease-spring);
+}
+
+.peer-card:hover {
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+  transform: translateY(-1px);
+}
+
+.peer-avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  background: #ffffff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+  position: relative;
+}
+
+.peer-online-dot {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 10px;
+  height: 10px;
+  background-color: var(--macos-accent-green);
+  border: 2px solid #ffffff;
+  border-radius: 50%;
+}
+
+.peer-info {
+  flex: 1;
+}
+
+.peer-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--macos-text-primary);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.peer-role {
+  font-size: 12px;
+  color: var(--macos-text-secondary);
+}
+
+/* Speaking Balance Gauge */
+.speaking-balance-container {
+  background: rgba(255, 255, 255, 0.65);
+  border: 1px solid var(--macos-border-subtle);
+  border-radius: 14px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.balance-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--macos-text-secondary);
+}
+
+.balance-progress-bar {
+  height: 10px;
+  border-radius: 9999px;
+  background: rgba(0, 0, 0, 0.06);
+  display: flex;
+  overflow: hidden;
+  box-shadow: var(--macos-inner-shadow);
+}
+
+.balance-seg-a {
+  background: linear-gradient(90deg, #007aff, #30b0c7);
+  transition: width 0.5s var(--macos-ease-spring);
+}
+
+.balance-seg-b {
+  background: linear-gradient(90deg, #ff9500, #ff3b30);
+  transition: width 0.5s var(--macos-ease-spring);
+}
+
+.balance-legend {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--macos-text-tertiary);
+}
+
+/* Topic Card */
+.topic-card {
+  background: linear-gradient(135deg, rgba(0, 122, 255, 0.08), rgba(175, 82, 222, 0.08));
+  border: 1px solid rgba(0, 122, 255, 0.15);
+  border-radius: 14px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.topic-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--macos-accent-blue);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.topic-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--macos-text-primary);
+  line-height: 1.3;
+}
+
+.topic-prompt {
+  font-size: 13px;
+  color: var(--macos-text-secondary);
+  line-height: 1.4;
+}
+
+/* ==========================================================================
+   7. Center Panel: Live Subtitles Stream
+   ========================================================================== */
+.subtitles-stream-container {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  flex: 1;
+}
+
+.subtitle-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--macos-border-subtle);
+  border-radius: 14px;
+  padding: 12px 16px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.03), var(--macos-inner-glow);
+  animation: macos-entry-slide var(--macos-duration-normal) var(--macos-ease-spring);
+  transition: transform var(--macos-duration-fast) var(--macos-ease-spring);
+}
+
+.subtitle-entry:hover {
+  background: rgba(255, 255, 255, 0.92);
+  transform: translateY(-1px);
+}
+
+.subtitle-entry.ai-mediator {
+  background: linear-gradient(135deg, rgba(88, 86, 214, 0.08), rgba(0, 122, 255, 0.08));
+  border: 1px solid rgba(88, 86, 214, 0.2);
+}
+
+.subtitle-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.subtitle-speaker-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--macos-text-primary);
+}
+
+.subtitle-timestamp {
+  font-size: 11px;
+  color: var(--macos-text-tertiary);
+}
+
+.subtitle-original-text {
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--macos-text-primary);
+  line-height: 1.4;
+}
+
+.subtitle-transliteration-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-family: var(--macos-font-mono);
+  font-size: 12px;
+  color: var(--macos-accent-purple);
+  width: fit-content;
+}
+
+.subtitle-translations-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--macos-border-subtle);
+}
+
+.translation-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--macos-text-secondary);
+  line-height: 1.35;
+}
+
+.lang-flag-pill {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--macos-text-secondary);
+}
+
+/* ==========================================================================
+   8. Right Panel: Idiom Cards & Cultural Scaffolding
+   ========================================================================== */
+.idiom-card-container {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.idiom-bubble {
+  background: linear-gradient(145deg, #ffffff, rgba(245, 245, 247, 0.8));
+  border: 1px solid var(--macos-border-highlight);
+  border-radius: 14px;
+  padding: 14px;
+  box-shadow: var(--macos-shadow-card), var(--macos-inner-glow);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: macos-pop-in var(--macos-duration-normal) var(--macos-ease-bounce);
+  position: relative;
+}
+
+.idiom-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  background: rgba(52, 199, 89, 0.12);
+  color: var(--macos-accent-green);
+  width: fit-content;
+}
+
+.idiom-phrase {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--macos-text-primary);
+}
+
+.idiom-romaji {
+  font-family: var(--macos-font-mono);
+  font-size: 12px;
+  color: var(--macos-accent-blue);
+}
+
+.idiom-meaning {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--macos-text-primary);
+}
+
+.idiom-cultural-note {
+  font-size: 12px;
+  color: var(--macos-text-secondary);
+  background: rgba(0, 0, 0, 0.03);
+  padding: 8px 10px;
+  border-radius: 8px;
+  line-height: 1.4;
+}
+
+/* ==========================================================================
+   9. Interactive Quiz Widget
+   ========================================================================== */
+.quiz-container {
+  background: #ffffff;
+  border: 1px solid var(--macos-border-highlight);
+  border-radius: 14px;
+  padding: 14px;
+  box-shadow: var(--macos-shadow-card), var(--macos-inner-glow);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  animation: macos-pop-in var(--macos-duration-normal) var(--macos-ease-bounce);
+}
+
+.quiz-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.quiz-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--macos-accent-purple);
+  text-transform: uppercase;
+}
+
+.quiz-question {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--macos-text-primary);
+  line-height: 1.35;
+}
+
+.quiz-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.quiz-opt-btn {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--macos-bg-base);
+  border: 1px solid var(--macos-border-subtle);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--macos-text-primary);
+  cursor: pointer;
+  transition: all var(--macos-duration-fast) var(--macos-ease-spring);
+  text-align: left;
+}
+
+.quiz-opt-btn:hover {
+  background: rgba(0, 122, 255, 0.08);
+  border-color: rgba(0, 122, 255, 0.2);
+}
+
+.quiz-opt-btn.correct {
+  background: rgba(52, 199, 89, 0.15);
+  border-color: var(--macos-accent-green);
+  color: #1b5e20;
+  font-weight: 600;
+}
+
+.quiz-opt-btn.incorrect {
+  background: rgba(255, 59, 48, 0.15);
+  border-color: var(--macos-accent-red);
+  color: #b71c1c;
+}
+
+.quiz-explanation {
+  font-size: 12px;
+  color: var(--macos-text-secondary);
+  background: rgba(0, 0, 0, 0.03);
+  padding: 8px;
+  border-radius: 6px;
+  line-height: 1.35;
+}
+
+/* ==========================================================================
+   10. Teacher Oversight Floating Dock & Alert Bar
+   ========================================================================== */
+.teacher-dock {
+  background: var(--macos-surface-overlay);
+  backdrop-filter: var(--macos-blur-sheet);
+  -webkit-backdrop-filter: var(--macos-blur-sheet);
+  border: 1px solid var(--macos-border-highlight);
+  border-radius: 16px;
+  padding: 10px 18px;
+  box-shadow: var(--macos-shadow-dock), var(--macos-inner-glow);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-shrink: 0;
+}
+
+.teacher-dock.hidden {
+  display: none;
+}
+
+.teacher-alert-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  font-weight: 500;
+  flex: 1;
+}
+
+.teacher-alert-pill {
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.teacher-alert-pill.warning {
+  background: rgba(255, 149, 0, 0.15);
+  color: var(--macos-accent-orange);
+}
+
+.teacher-alert-pill.info {
+  background: rgba(0, 122, 255, 0.15);
+  color: var(--macos-accent-blue);
+}
+
+.teacher-alert-pill.critical {
+  background: rgba(255, 59, 48, 0.15);
+  color: var(--macos-accent-red);
+}
+
+.teacher-actions-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* ==========================================================================
+   11. Keyframe Animations
+   ========================================================================== */
+@keyframes macos-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(0.9);
+  }
+}
+
+@keyframes macos-entry-slide {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes macos-pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
