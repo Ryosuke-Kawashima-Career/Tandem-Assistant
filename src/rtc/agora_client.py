@@ -203,6 +203,10 @@ class AgoraVoiceChannelClient:
 
         return True
 
+    def send_data_stream(self, event_type: str, payload: Dict[str, Any]) -> bool:
+        """Alias for send_data_stream_message."""
+        return self.send_data_stream_message(event_type, payload)
+
     def publish_audio_frame(self, pcm_data: bytes, sample_rate: int = 16000) -> bool:
         """
         Pushes synthesized or processed PCM audio into the Agora RTC audio bus.
