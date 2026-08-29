@@ -172,10 +172,27 @@ class EchoSphereServer:
         exactly one place.
 
         Algorithm:
+        0. Skip entirely when the backend RTC client is not in the channel.
         1. Broadcast tri-lingual subtitles when the agent returned a subtitle block.
         2. Broadcast the cultural idiom card when one was detected.
         3. Broadcast the comprehension quiz widget when one is active.
+
+        Step 0 matters for the Convo AI path: that flow never calls /api/session/start,
+        so this client is not connected and every dispatch would log a warning per
+        payload. Live transcripts for Convo AI conversations reach the browser over
+        RTM directly from the Convo AI Engine instead (see
+        app/src/services/convoaiTranscript.js), so nothing is lost by skipping here.
+
+        Known gap: idiom cards and quizzes generated on the Convo AI path have no
+        delivery route to the browser yet - RTM carries transcripts only.
         """
+        if not self.rtc_client.is_connected:
+            logger.debug(
+                "Skipping data stream broadcast: backend RTC client not in channel "
+                "(expected on the Convo AI path; transcripts arrive via RTM)."
+            )
+            return
+
         if "subtitles" in turn_result:
             sub = turn_result["subtitles"]
             self.data_stream.send_subtitle(
@@ -320,12 +337,20 @@ def api_rtc_token():
         and is_usable_credential(token_client.app_certificate)
     )
 
+    # The Convo AI Engine publishes live transcripts and agent-state events over RTM
+    # on a channel named after the RTC channel. The client needs a separate RTM token
+    # to subscribe. Its identity MUST be str(uid) - the same value the client logs in
+    # with - or RTM auth fails in ways that surface as generic startup errors.
+    rtm_token = token_client.generate_rtm_token(str(uid))
+
     return jsonify({
         "success": True,
         "app_id": token_client.app_id,
         "channel": channel,
         "uid": uid,
         "token": token,
+        "rtm_token": rtm_token,
+        "rtm_user_id": str(uid),
         "simulated": simulated
     }), 200
 

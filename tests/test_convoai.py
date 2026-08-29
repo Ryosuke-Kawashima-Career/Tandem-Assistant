@@ -393,6 +393,57 @@ class TestConvoAIEndpoints(unittest.TestCase):
         self.assertNotIn("app_certificate", data)
         self.assertNotIn("mock_certificate", res.get_data(as_text=True))
 
+    def test_rtc_token_includes_rtm_credentials(self):
+        """
+        Verify the token endpoint also returns RTM credentials.
+
+        The Convo AI Engine publishes transcripts over RTM, and the RTM identity must
+        equal the value the client logs in with - str(uid) - or RTM auth fails in ways
+        that surface as generic conversation-start errors rather than a clear 401.
+        """
+        res = self.app.get("/api/rtc/token?channel=tokyo-mumbai-101&uid=4242")
+        data = res.get_json()
+
+        self.assertTrue(data["rtm_token"])
+        self.assertEqual(data["rtm_user_id"], "4242")
+        self.assertEqual(data["rtm_user_id"], str(data["uid"]))
+        # RTC and RTM tokens are distinct credentials, not the same string reused
+        self.assertNotEqual(data["rtm_token"], data["token"])
+
+    def test_broadcast_skipped_when_backend_rtc_disconnected(self):
+        """
+        Verify turn payloads are not dispatched when the backend RTC client is not in
+        the channel, which is the normal state on the Convo AI path.
+
+        Previously every Convo AI turn logged one warning per payload type. Transcripts
+        now reach the browser over RTM, so skipping here is correct rather than lossy.
+        """
+        server_instance.rtc_client.is_connected = False
+
+        with patch.object(server_instance.data_stream, "send_subtitle") as mock_sub, \
+                patch.object(server_instance.data_stream, "send_idiom_card") as mock_card:
+            server_instance.process_convoai_turn(
+                speaker_id="Learner", text="一期一会ですね！", language="ja"
+            )
+
+        mock_sub.assert_not_called()
+        mock_card.assert_not_called()
+
+    def test_broadcast_still_runs_on_ambient_path(self):
+        """
+        Verify the ambient tandem mediation path still broadcasts when the backend RTC
+        client IS connected - the skip above must not disable peer-session scaffolding.
+        """
+        server_instance.rtc_client.is_connected = True
+        try:
+            with patch.object(server_instance.data_stream, "send_subtitle") as mock_sub:
+                server_instance.process_convoai_turn(
+                    speaker_id="Learner", text="一期一会ですね！", language="ja"
+                )
+            mock_sub.assert_called_once()
+        finally:
+            server_instance.rtc_client.is_connected = False
+
     def test_rtc_token_flags_simulated_mode(self):
         """
         Verify the endpoint advertises simulated mode when no real App ID is set, so

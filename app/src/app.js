@@ -16,6 +16,7 @@
 import AgoraRTC from 'agora-rtc-sdk-ng';
 import { AgoraStreamManager } from './services/agoraStream.js';
 import { ConvoAIService } from './services/convoai.js';
+import { ConvoAITranscriptService } from './services/convoaiTranscript.js';
 import { Subtitles } from './components/Subtitles.js';
 import { IdiomCard } from './components/IdiomCard.js';
 import { TopicWidget } from './components/TopicWidget.js';
@@ -52,6 +53,11 @@ class TandemApp {
     // True only when a real RTC join published a live microphone track. A spoken AI
     // conversation is impossible without this, so it gates startConvoAI().
     this.hasLiveAudio = false;
+
+    // Live transcripts and agent state, delivered over RTM by the Convo AI Engine
+    this.transcriptService = new ConvoAITranscriptService();
+    this.rtcCredentials = null;
+    this.setupTranscriptListeners();
 
     // Step 2: Initialize UI Components
     this.subtitles = new Subtitles('#subtitles-container');
@@ -271,6 +277,58 @@ class TandemApp {
   }
 
   /**
+   * Wires Convo AI transcript and agent-state events into the UI.
+   *
+   * Algorithm:
+   * 1. On transcript update, re-render the whole subtitle stream. The toolkit
+   *    delivers the complete history each time, so appending would duplicate rows.
+   * 2. On agent state change, reflect listening/thinking/speaking in the status pill.
+   * 3. On agent error, surface the failing module rather than failing silently.
+   */
+  setupTranscriptListeners() {
+    this.transcriptService.on('transcript', (transcript) => {
+      this.renderTranscript(transcript);
+    });
+
+    this.transcriptService.on('agentState', (state) => {
+      if (this.isAiActive && state) {
+        this.updateConvoAIUi('live', state);
+      }
+    });
+
+    this.transcriptService.on('agentError', (error) => {
+      const detail = `${error?.type || 'agent'}: ${error?.message || 'unknown error'}`;
+      this.updateConvoAIUi('error', detail);
+    });
+  }
+
+  /**
+   * Re-renders the subtitle stream from a complete Convo AI transcript history.
+   *
+   * The toolkit's TRANSCRIPT_UPDATED event carries the full conversation every
+   * time, so the stream is rebuilt rather than appended to.
+   *
+   * @param {Array} transcript - Full transcript history from the toolkit
+   */
+  renderTranscript(transcript) {
+    if (!Array.isArray(transcript)) return;
+
+    this.subtitles.clear();
+    transcript.forEach((item) => {
+      const text = item.text || item.content || '';
+      if (!text) return;
+
+      // The agent's own turns are flagged by the toolkit; everything else is the learner.
+      const isAgent = item.isAgent ?? item.is_agent ?? (item.role === 'assistant');
+
+      this.subtitles.addSubtitle({
+        speaker: isAgent ? 'EchoSphere AI Co-Teacher' : 'You',
+        original_text: text
+      });
+    });
+  }
+
+  /**
    * Reports why the microphone is unusable, or null when it is available.
    *
    * Browsers only expose getUserMedia on a secure context. localhost and 127.0.0.1
@@ -330,8 +388,19 @@ class TandemApp {
           await this.agoraClient.publish([this.localAudioTrack]);
 
           this.hasLiveAudio = true;
+          this.rtcCredentials = creds;
           if (connStatus) connStatus.textContent = 'Live Audio Connected';
           console.log('✅ Connected to EchoSphere SD-RTN Voice Channel.');
+
+          // Subscribe to Convo AI transcripts over RTM. Non-fatal on failure:
+          // the voice conversation still works, only live subtitles are lost.
+          await this.transcriptService.connect({
+            rtcClient: this.agoraClient,
+            appId: creds.app_id,
+            channel: creds.channel,
+            rtmToken: creds.rtm_token,
+            rtmUserId: creds.rtm_user_id
+          });
         } else if (micBlockedReason) {
           // Credentials may be fine, but this origin can never capture audio.
           console.error(`🎙️ ${micBlockedReason}`);
@@ -419,12 +488,15 @@ class TandemApp {
    * Safe to call when nothing is currently allocated.
    */
   async releaseRtcResources() {
+    await this.transcriptService.disconnect();
+
     if (this.localAudioTrack) {
       this.localAudioTrack.close();
       this.localAudioTrack = null;
     }
     this.remoteAudioTracks.clear();
     this.hasLiveAudio = false;
+    this.rtcCredentials = null;
 
     if (this.agoraClient) {
       try {
@@ -592,10 +664,20 @@ class TandemApp {
     // tooltip so a long diagnostic reason is never truncated away entirely.
     const shortDetail = detail.length > 60 ? `${detail.slice(0, 57)}…` : detail;
 
+    // Agent state arrives from RTM as 'listening' | 'thinking' | 'speaking' | 'silent'
+    const agentStateLabels = {
+      listening: 'AI is Listening',
+      thinking: 'AI is Thinking…',
+      speaking: 'AI is Speaking',
+      silent: 'AI is Idle',
+      idle: 'AI is Idle'
+    };
+    const liveLabel = agentStateLabels[detail] || 'AI is Listening';
+
     const states = {
       idle:     { text: 'Talk to AI',    icon: '🤖', pill: '',                       show: false },
       starting: { text: 'Connecting…',   icon: '⏳', pill: 'AI Co-Teacher Joining…', show: true },
-      live:     { text: 'End AI Chat',   icon: '🎧', pill: 'AI is Listening',        show: true },
+      live:     { text: 'End AI Chat',   icon: '🎧', pill: liveLabel,                show: true },
       error:    { text: 'Talk to AI',    icon: '⚠️', pill: shortDetail || 'AI Error', show: true }
     };
     const config = states[state] || states.idle;

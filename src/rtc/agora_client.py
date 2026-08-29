@@ -23,7 +23,7 @@ from dataclasses import dataclass, asdict
 logger = logging.getLogger("echosphere.rtc.agora_client")
 
 try:
-    from agora_token_builder import RtcTokenBuilder
+    from agora_token_builder import RtcTokenBuilder, RtmTokenBuilder
     # Agora SD-RTN standard role constants
     Role_Attendee = 0
     Role_Publisher = 1
@@ -178,6 +178,38 @@ class AgoraVoiceChannelClient:
         mock_token = f"agora_mock_tok_{self.app_id[:6]}_{self.channel_name}_{self.uid}_{privilege_expired_ts}"
         self.current_token = mock_token
         return mock_token
+
+    def generate_rtm_token(self, user_id: str) -> str:
+        """
+        Generates an Agora RTM token so a client can subscribe to signaling messages.
+
+        The Convo AI Engine publishes conversation transcripts and agent-state events
+        over RTM, so the browser needs this in addition to its RTC channel token.
+
+        Algorithm:
+        1. Calculate the Unix expiration timestamp.
+        2. Invoke RtmTokenBuilder.buildToken for the given user identity.
+        3. Fall back to a mock signature when the builder or credentials are absent.
+
+        The `user_id` must match the identity the RTM client logs in with.
+        """
+        privilege_expired_ts = int(time.time()) + self.token_expiration_seconds
+
+        if AGORA_BUILDER_AVAILABLE and is_usable_credential(self.app_id) \
+                and is_usable_credential(self.app_certificate):
+            try:
+                # role is accepted for API compatibility; RTM tokens carry login privilege
+                return RtmTokenBuilder.buildToken(
+                    self.app_id,
+                    self.app_certificate,
+                    user_id,
+                    Role_Publisher,
+                    privilege_expired_ts
+                )
+            except Exception as exc:
+                logger.error(f"Failed to generate Agora RTM token: {exc}")
+
+        return f"agora_mock_rtm_tok_{self.app_id[:6]}_{user_id}_{privilege_expired_ts}"
 
     def join_channel(self) -> bool:
         """
