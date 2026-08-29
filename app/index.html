@@ -27,6 +27,10 @@
           <span class="status-dot" id="connection-dot"></span>
           <span class="status-text" id="connection-status">SD-RTN™ Ready</span>
         </div>
+        <div class="convoai-status-pill hidden" id="convoai-status-pill">
+          <span class="convoai-pulse-dot"></span>
+          <span id="convoai-status-text">AI Co-Teacher Idle</span>
+        </div>
       </div>
     </header>
 
@@ -42,6 +46,19 @@
           <span id="btn-mic-icon">🎙️</span>
           <span id="btn-mic-text">Mute Mic</span>
         </button>
+
+        <div style="width: 1px; height: 18px; background: var(--macos-border-subtle); margin: 0 4px;"></div>
+
+        <button class="macos-action-btn convoai" id="btn-convoai" title="Start a live spoken conversation with the AI co-teacher">
+          <span id="btn-convoai-icon">🤖</span>
+          <span id="btn-convoai-text">Talk to AI</span>
+        </button>
+
+        <select class="macos-lang-select" id="convoai-language" title="Language the AI co-teacher will speak">
+          <option value="en">🇬🇧 English</option>
+          <option value="ja">🇯🇵 Japanese</option>
+          <option value="hi">🇮🇳 Hindi</option>
+        </select>
 
         <div style="width: 1px; height: 18px; background: var(--macos-border-subtle); margin: 0 4px;"></div>
 

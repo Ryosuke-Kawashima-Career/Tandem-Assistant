@@ -299,6 +299,96 @@ body {
   color: #ffffff;
 }
 
+/* --- Convo AI: Direct Spoken Conversation Controls (REQ-09) --- */
+.macos-action-btn.convoai {
+  background: rgba(175, 82, 222, 0.1);
+  color: var(--macos-accent-purple);
+  border-color: rgba(175, 82, 222, 0.2);
+}
+
+.macos-action-btn.convoai:hover {
+  background: var(--macos-accent-purple);
+  color: #ffffff;
+}
+
+.macos-action-btn.convoai.listening {
+  background: var(--macos-accent-purple);
+  color: #ffffff;
+  border-color: transparent;
+  box-shadow: 0 2px 12px rgba(175, 82, 222, 0.35);
+}
+
+.macos-action-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.macos-lang-select {
+  padding: 7px 12px;
+  border-radius: 9999px;
+  background: var(--macos-bg-canvas);
+  color: var(--macos-text-primary);
+  border: 1px solid var(--macos-border-subtle);
+  font-family: var(--macos-font-sans);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: var(--macos-shadow-button), var(--macos-inner-glow);
+  transition: all var(--macos-duration-fast) var(--macos-ease-spring);
+}
+
+.macos-lang-select:hover {
+  background: #ffffff;
+  border-color: var(--macos-border-highlight);
+}
+
+.convoai-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 9999px;
+  background: rgba(175, 82, 222, 0.1);
+  border: 1px solid rgba(175, 82, 222, 0.2);
+  color: var(--macos-accent-purple);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.convoai-status-pill.hidden {
+  display: none;
+}
+
+/* Diagnostic state: agent could not start, or never joined the channel. */
+.convoai-status-pill.error {
+  background: rgba(255, 59, 48, 0.1);
+  border-color: rgba(255, 59, 48, 0.2);
+  color: var(--macos-accent-red);
+  cursor: help;
+}
+
+.convoai-status-pill.error .convoai-pulse-dot {
+  animation: none;
+}
+
+.convoai-pulse-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: currentColor;
+  animation: convoai-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes convoai-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.8); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .convoai-pulse-dot { animation: none; }
+}
+
 /* ==========================================================================
    5. 3-Column macOS Frosted Workspace Layout
    ========================================================================== */

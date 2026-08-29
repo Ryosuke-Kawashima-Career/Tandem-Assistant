@@ -37,6 +37,7 @@ next-env.d.ts
 
 # Personal directories and files
 .agents
+.claude
 dev/
 experiment/
 figures/

@@ -11,6 +11,7 @@ dependencies = [
     "agora-token-builder>=1.0.0",
     "edge-tts>=6.1.12",
     "fastapi>=0.111.0",
+    "flask>=3.0.0",
     "google-genai>=0.1.1",
     "gtts>=2.5.1",
     "numpy>=1.26.0",

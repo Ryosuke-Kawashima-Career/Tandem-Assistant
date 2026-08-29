@@ -23,11 +23,53 @@ from dataclasses import dataclass, asdict
 logger = logging.getLogger("echosphere.rtc.agora_client")
 
 try:
-    from agora_token_builder import RtcTokenBuilder, Role_Publisher, Role_Subscriber
+    from agora_token_builder import RtcTokenBuilder
+    # Agora SD-RTN standard role constants
+    Role_Attendee = 0
+    Role_Publisher = 1
+    Role_Subscriber = 2
+    Role_Admin = 101
     AGORA_BUILDER_AVAILABLE = True
 except ImportError:
     AGORA_BUILDER_AVAILABLE = False
+    Role_Attendee = 0
+    Role_Publisher = 1
+    Role_Subscriber = 2
+    Role_Admin = 101
     logger.warning("agora-token-builder not available. Using simulated token generation.")
+
+
+def is_usable_credential(value: Optional[str]) -> bool:
+    """
+    Reports whether an Agora credential is real rather than a placeholder.
+
+    Agora App IDs and App Certificates are 32-character hexadecimal strings. A value
+    that is empty, the built-in mock sentinel, or an unfilled `.env.example` template
+    placeholder (e.g. 'your_agora_app_id_here') fails this check.
+
+    This matters because copying `.env.example` to `.env` without filling it in leaves
+    non-empty but unusable values; without this check the backend would advertise live
+    credentials and the browser would attempt a join that fails with 'invalid vendor key'.
+
+    Algorithm:
+    1. Reject empty or missing values.
+    2. Reject the known mock sentinels.
+    3. Require exactly 32 hexadecimal characters.
+    """
+    if not value:
+        return False
+    if value in ("mock_app_id", "mock_certificate"):
+        return False
+
+    candidate = value.strip()
+    if len(candidate) != 32:
+        return False
+
+    try:
+        int(candidate, 16)
+    except ValueError:
+        return False
+    return True
 
 
 @dataclass
@@ -117,16 +159,18 @@ class AgoraVoiceChannelClient:
         # Step 3: Build token
         if AGORA_BUILDER_AVAILABLE and self.app_id != "mock_app_id" and self.app_certificate != "mock_certificate":
             try:
-                token = RtcTokenBuilder.build_token_with_uid(
-                    self.app_id,
-                    self.app_certificate,
-                    self.channel_name,
-                    self.uid,
-                    agora_role,
-                    privilege_expired_ts
-                )
-                self.current_token = token
-                return token
+                builder_fn = getattr(RtcTokenBuilder, "buildTokenWithUid", getattr(RtcTokenBuilder, "build_token_with_uid", None))
+                if builder_fn:
+                    token = builder_fn(
+                        self.app_id,
+                        self.app_certificate,
+                        self.channel_name,
+                        self.uid,
+                        agora_role,
+                        privilege_expired_ts
+                    )
+                    self.current_token = token
+                    return token
             except Exception as exc:
                 logger.error(f"Failed to generate Agora token with RtcTokenBuilder: {exc}")
 

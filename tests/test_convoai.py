@@ -1,0 +1,495 @@
+"""
+Summary:
+    test_convoai.py provides automated unit and integration tests for EchoSphere's
+    Agora Conversational AI (Convo AI) integration.
+    It verifies join payload construction against the documented Convo AI field
+    contract, tri-lingual ASR configuration for Hindi/Japanese/English, agent session
+    lifecycle (start / query / stop), the REST endpoints exposed by server.py, and the
+    OpenAI-compatible streaming Custom LLM bridge.
+
+Key Test Classes:
+    - TestConvoAIClient: Join payload contract and agent session lifecycle.
+    - TestConvoAIEndpoints: Flask REST surface and SSE Custom LLM bridge.
+"""
+
+import json
+import unittest
+from unittest.mock import patch, MagicMock
+
+from src.rtc.convoai_client import (
+    ConvoAIClient,
+    ConvoAIAgentSession,
+    LANGUAGE_PROFILES,
+    AGENT_STATUS_RUNNING,
+    AGENT_STATUS_STOPPED,
+)
+from src.rtc.agora_client import is_usable_credential
+from src.server import app, server_instance
+
+# Realistic Agora credential format: 32 hexadecimal characters.
+VALID_APP_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+VALID_CERTIFICATE = "0f9e8d7c6b5a49382716f5e4d3c2b1a0"
+
+
+class TestConvoAIClient(unittest.TestCase):
+    """
+    Test suite verifying Convo AI join payload construction and session lifecycle.
+    """
+
+    def setUp(self):
+        """Initialize a ConvoAI client without live credentials (simulated mode)."""
+        self.client = ConvoAIClient(
+            app_id="mock_app_id",
+            app_certificate="mock_certificate",
+            llm_base_url="http://localhost:8000",
+        )
+
+    def test_simulated_mode_when_credentials_absent(self):
+        """
+        Verify the client degrades to simulated mode without real Agora credentials,
+        matching the mock-first behaviour of AgoraVoiceChannelClient.
+        """
+        self.assertFalse(self.client.is_live_mode())
+
+    def test_unfilled_env_placeholders_stay_simulated(self):
+        """
+        Verify placeholder credentials from an uncustomised `.env` do not count as live.
+
+        Copying `.env.example` to `.env` without filling it in leaves non-empty but
+        unusable values. Treating those as live makes the browser attempt a join that
+        fails with 'invalid vendor key', so they must resolve to simulated mode.
+        """
+        placeholder_client = ConvoAIClient(
+            app_id="your_agora_app_id_here",
+            app_certificate="your_agora_app_certificate_here",
+            customer_id="your_agora_customer_id_here",
+            customer_secret="your_agora_customer_secret_here",
+        )
+        self.assertFalse(placeholder_client.is_live_mode())
+
+    def test_credential_format_validation(self):
+        """
+        Verify only 32-character hexadecimal values are accepted as real credentials.
+        """
+        self.assertTrue(is_usable_credential(VALID_APP_ID))
+        self.assertTrue(is_usable_credential(VALID_CERTIFICATE))
+
+        for rejected in [
+            None,
+            "",
+            "mock_app_id",
+            "mock_certificate",
+            "your_agora_app_id_here",
+            "a1b2c3",                              # too short
+            "a1b2c3d4e5f60718293a4b5c6d7e8f90ab",  # too long
+            "z1b2c3d4e5f60718293a4b5c6d7e8f90",    # non-hexadecimal
+        ]:
+            self.assertFalse(is_usable_credential(rejected), f"should reject {rejected!r}")
+
+    def test_join_payload_field_contract(self):
+        """
+        Verify the join payload matches the documented Convo AI field contract.
+
+        Algorithm:
+        1. Build a payload for a Japanese tandem session.
+        2. Assert agent_rtc_uid is a string and remote_rtc_uids is an array of strings.
+        3. Assert the required channel/token/llm/tts blocks are populated.
+        """
+        payload = self.client.build_join_payload(channel="tokyo-mumbai-101", language="ja")
+        props = payload["properties"]
+
+        # Field types that the API rejects when sent as the wrong type
+        self.assertIsInstance(props["agent_rtc_uid"], str)
+        self.assertIsInstance(props["remote_rtc_uids"], list)
+        self.assertTrue(all(isinstance(uid, str) for uid in props["remote_rtc_uids"]))
+        self.assertEqual(props["remote_rtc_uids"], ["*"])
+
+        # Required blocks
+        self.assertEqual(props["channel"], "tokyo-mumbai-101")
+        self.assertTrue(props["token"])
+        self.assertTrue(payload["name"])
+        self.assertIn("vendor", props["tts"])
+        self.assertIn("url", props["llm"])
+
+    def test_microsoft_tts_params_include_key_and_region(self):
+        """
+        Verify the default 'microsoft' TTS vendor gets `key` and `region` in its
+        params object, not just `voice_name`.
+
+        The Convo AI join endpoint requires vendor-specific params (Azure Speech
+        needs a resource key + region to authenticate), so shipping only voice_name
+        would be rejected or silently misconfigured against a live Agora project.
+        """
+        with patch.dict("os.environ", {
+            "CONVOAI_TTS_KEY": "azure-key-123",
+            "CONVOAI_TTS_REGION": "eastus",
+            "CONVOAI_TTS_VOICE_JA": "ja-JP-NanamiNeural",
+        }):
+            payload = self.client.build_join_payload(channel="test-room", language="ja")
+
+        tts_params = payload["properties"]["tts"]["params"]
+        self.assertEqual(tts_params["key"], "azure-key-123")
+        self.assertEqual(tts_params["region"], "eastus")
+        self.assertEqual(tts_params["voice_name"], "ja-JP-NanamiNeural")
+
+    def test_non_microsoft_tts_vendor_only_sends_voice_name(self):
+        """Verify a non-default vendor does not get Microsoft-specific key/region."""
+        with patch.dict("os.environ", {
+            "CONVOAI_TTS_VENDOR": "elevenlabs",
+            "CONVOAI_TTS_VOICE_EN": "some-voice-id",
+        }):
+            payload = self.client.build_join_payload(channel="test-room", language="en")
+
+        tts_params = payload["properties"]["tts"]["params"]
+        self.assertNotIn("key", tts_params)
+        self.assertNotIn("region", tts_params)
+        self.assertEqual(tts_params["voice_name"], "some-voice-id")
+
+    def test_join_payload_targets_custom_llm_bridge(self):
+        """
+        Verify the llm.url points at EchoSphere's own /chat/completions bridge so the
+        TeachingAgent orchestrator is reused rather than an external vendor LLM.
+        """
+        payload = self.client.build_join_payload(channel="test-room", language="en")
+        self.assertEqual(
+            payload["properties"]["llm"]["url"],
+            "http://localhost:8000/chat/completions"
+        )
+
+    def test_tri_lingual_asr_language_mapping(self):
+        """
+        Verify each in-scope language (hi / ja / en) maps to its ASR language code.
+        """
+        expected = {"en": "en-US", "ja": "ja-JP", "hi": "hi-IN"}
+        for lang, asr_code in expected.items():
+            payload = self.client.build_join_payload(channel="test-room", language=lang)
+            self.assertEqual(payload["properties"]["asr"]["language"], asr_code)
+            self.assertIn(lang, LANGUAGE_PROFILES)
+
+    def test_unknown_language_falls_back_to_english(self):
+        """Verify an unsupported language code degrades to the English profile."""
+        payload = self.client.build_join_payload(channel="test-room", language="fr")
+        self.assertEqual(payload["properties"]["asr"]["language"], "en-US")
+
+    def test_agent_names_are_unique_per_session(self):
+        """
+        Verify generated agent names differ across sessions, since duplicate names
+        are rejected by the Convo AI Engine with HTTP 409.
+        """
+        names = {self.client._generate_agent_name("same-channel") for _ in range(10)}
+        self.assertEqual(len(names), 10)
+
+    def test_agent_session_lifecycle(self):
+        """
+        Verify start -> query -> stop transitions and session registry bookkeeping.
+        """
+        session = self.client.start_agent(channel="tokyo-mumbai-101", language="ja")
+
+        self.assertIsInstance(session, ConvoAIAgentSession)
+        self.assertTrue(session.agent_id)
+        self.assertEqual(session.status, AGENT_STATUS_RUNNING)
+        self.assertEqual(session.language, "ja")
+        self.assertIn("tokyo-mumbai-101", self.client.active_sessions)
+
+        queried = self.client.query_agent(channel="tokyo-mumbai-101")
+        self.assertEqual(queried["agent_id"], session.agent_id)
+
+        self.assertTrue(self.client.stop_agent(channel="tokyo-mumbai-101"))
+        self.assertEqual(session.status, AGENT_STATUS_STOPPED)
+        self.assertNotIn("tokyo-mumbai-101", self.client.active_sessions)
+
+    def test_stop_unknown_session_returns_false(self):
+        """Verify stopping a non-existent agent reports failure instead of raising."""
+        self.assertFalse(self.client.stop_agent(channel="never-started"))
+
+    def test_live_mode_posts_join_request(self):
+        """
+        Verify that with real credentials the client POSTs to the documented /join URL
+        and parses agent_id from the response.
+
+        Algorithm:
+        1. Construct a client with live credentials.
+        2. Patch requests.post to return a stubbed Convo AI response.
+        3. Assert the request URL, auth header, and parsed session fields.
+        """
+        live_client = ConvoAIClient(
+            app_id=VALID_APP_ID,
+            app_certificate=VALID_CERTIFICATE,
+            customer_id="cust_id",
+            customer_secret="cust_secret",
+        )
+        self.assertTrue(live_client.is_live_mode())
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "agent_id": "agent-abc-123",
+            "create_ts": 1735000000,
+            "status": "STARTING",
+        }
+
+        with patch("src.rtc.convoai_client.requests.post", return_value=mock_response) as mock_post:
+            session = live_client.start_agent(channel="live-room", language="hi")
+
+        mock_post.assert_called_once()
+        called_url = mock_post.call_args[0][0]
+        called_headers = mock_post.call_args[1]["headers"]
+
+        self.assertTrue(called_url.endswith(f"/{VALID_APP_ID}/join"))
+        self.assertTrue(called_headers["Authorization"].startswith("Basic "))
+        self.assertEqual(session.agent_id, "agent-abc-123")
+        self.assertEqual(session.status, "STARTING")
+        self.assertFalse(session.simulated)
+
+    def test_live_mode_stop_treats_404_as_already_stopped(self):
+        """
+        Verify stop_agent() succeeds when Agora returns 404 on /leave, matching a
+        real-world sequence: the Convo AI Engine auto-terminates an agent on
+        idle_timeout (default 30s) before the client calls stop, so the agent_id is
+        already gone. The desired end state (no agent running) is already true, so
+        this must not surface as a failure.
+        """
+        live_client = ConvoAIClient(
+            app_id=VALID_APP_ID,
+            app_certificate=VALID_CERTIFICATE,
+            customer_id="cust_id",
+            customer_secret="cust_secret",
+        )
+
+        join_response = MagicMock(status_code=200)
+        join_response.json.return_value = {"agent_id": "agent-expired-1", "status": "STARTING"}
+        with patch("src.rtc.convoai_client.requests.post", return_value=join_response):
+            live_client.start_agent(channel="idle-room", language="en")
+
+        leave_404 = MagicMock(status_code=404)
+        leave_404.raise_for_status.side_effect = AssertionError(
+            "raise_for_status() must not be called on a 404 leave response"
+        )
+        with patch("src.rtc.convoai_client.requests.post", return_value=leave_404):
+            result = live_client.stop_agent(channel="idle-room")
+
+        self.assertTrue(result)
+        self.assertNotIn("idle-room", live_client.active_sessions)
+
+    def test_live_mode_stop_still_raises_on_other_errors(self):
+        """Verify a non-404 failure (e.g. 500) on /leave still surfaces as an error."""
+        import requests as requests_module
+
+        live_client = ConvoAIClient(
+            app_id=VALID_APP_ID,
+            app_certificate=VALID_CERTIFICATE,
+            customer_id="cust_id",
+            customer_secret="cust_secret",
+        )
+
+        join_response = MagicMock(status_code=200)
+        join_response.json.return_value = {"agent_id": "agent-2", "status": "STARTING"}
+        with patch("src.rtc.convoai_client.requests.post", return_value=join_response):
+            live_client.start_agent(channel="broken-room", language="en")
+
+        leave_500 = MagicMock(status_code=500)
+        leave_500.raise_for_status.side_effect = requests_module.HTTPError("500 Server Error")
+        with patch("src.rtc.convoai_client.requests.post", return_value=leave_500):
+            with self.assertRaises(requests_module.HTTPError):
+                live_client.stop_agent(channel="broken-room")
+
+    def test_live_mode_retries_once_on_name_collision(self):
+        """
+        Verify an HTTP 409 agent-name collision triggers exactly one retry with a
+        freshly generated name.
+        """
+        live_client = ConvoAIClient(
+            app_id=VALID_APP_ID,
+            app_certificate=VALID_CERTIFICATE,
+            customer_id="cust_id",
+            customer_secret="cust_secret",
+        )
+
+        conflict = MagicMock(status_code=409)
+        success = MagicMock(status_code=200)
+        success.json.return_value = {"agent_id": "agent-retry-1", "status": "STARTING"}
+
+        with patch("src.rtc.convoai_client.requests.post", side_effect=[conflict, success]) as mock_post:
+            session = live_client.start_agent(channel="busy-room", language="en")
+
+        self.assertEqual(mock_post.call_count, 2)
+        first_name = mock_post.call_args_list[0][1]["json"]["name"]
+        second_name = mock_post.call_args_list[1][1]["json"]["name"]
+        self.assertNotEqual(first_name, second_name)
+        self.assertEqual(session.agent_id, "agent-retry-1")
+
+
+class TestConvoAIEndpoints(unittest.TestCase):
+    """
+    Test suite verifying the Convo AI REST surface and Custom LLM streaming bridge.
+    """
+
+    def setUp(self):
+        """Initialize the Flask test client and clear any residual agent sessions."""
+        self.app = app.test_client()
+        server_instance.convoai.active_sessions.clear()
+
+    def test_module_singleton_never_hits_real_agora_api(self):
+        """
+        Safety invariant: the shared server_instance.convoai must stay in simulated
+        mode during the test suite, even on a machine whose real .env holds working
+        Agora credentials (tests/conftest.py enforces this).
+
+        If this ever fails, /api/convoai/start in the tests above would silently
+        start issuing live POST requests to Agora's REST API on every test run.
+        """
+        self.assertFalse(server_instance.convoai.is_live_mode())
+
+    def test_convoai_session_start_and_stop(self):
+        """
+        Verify the /api/convoai/start and /api/convoai/stop lifecycle endpoints.
+        """
+        start_res = self.app.post("/api/convoai/start", json={"language": "ja"})
+        self.assertEqual(start_res.status_code, 200)
+        start_data = start_res.get_json()
+        self.assertTrue(start_data["success"])
+        self.assertTrue(start_data["agent"]["agent_id"])
+        self.assertEqual(start_data["agent"]["language"], "ja")
+
+        stop_res = self.app.post("/api/convoai/stop", json={})
+        self.assertEqual(stop_res.status_code, 200)
+        self.assertTrue(stop_res.get_json()["success"])
+
+    def test_convoai_status_endpoint(self):
+        """
+        Verify /api/convoai/status reports the active agent for a channel.
+        """
+        self.app.post("/api/convoai/start", json={"language": "hi"})
+        status_res = self.app.get("/api/convoai/status")
+
+        self.assertEqual(status_res.status_code, 200)
+        status_data = status_res.get_json()
+        self.assertTrue(status_data["success"])
+        self.assertEqual(status_data["agent"]["language"], "hi")
+        self.assertEqual(len(status_data["active_sessions"]), 1)
+
+    def test_stop_without_active_agent_returns_404(self):
+        """Verify stopping when no agent is running reports 404 rather than 200."""
+        stop_res = self.app.post("/api/convoai/stop", json={})
+        self.assertEqual(stop_res.status_code, 404)
+        self.assertFalse(stop_res.get_json()["success"])
+
+    def test_rtc_token_endpoint_supplies_browser_credentials(self):
+        """
+        Verify /api/rtc/token returns the App ID, channel, and token the browser needs
+        to join the same channel as the agent, and never leaks the App Certificate.
+        """
+        res = self.app.get("/api/rtc/token?channel=tokyo-mumbai-101&uid=4242")
+        self.assertEqual(res.status_code, 200)
+
+        data = res.get_json()
+        self.assertTrue(data["success"])
+        self.assertEqual(data["channel"], "tokyo-mumbai-101")
+        self.assertEqual(data["uid"], 4242)
+        self.assertTrue(data["token"])
+        self.assertIn("app_id", data)
+
+        # The App Certificate must never be serialized to the client
+        self.assertNotIn("app_certificate", data)
+        self.assertNotIn("mock_certificate", res.get_data(as_text=True))
+
+    def test_rtc_token_flags_simulated_mode(self):
+        """
+        Verify the endpoint advertises simulated mode when no real App ID is set, so
+        the client knows to stay in offline demo mode rather than attempting a join.
+        """
+        res = self.app.get("/api/rtc/token")
+        self.assertTrue(res.get_json()["simulated"])
+
+    def test_rtc_token_rejects_non_integer_uid(self):
+        """Verify a malformed uid is rejected with 400 rather than raising a 500."""
+        res = self.app.get("/api/rtc/token?uid=not-a-number")
+        self.assertEqual(res.status_code, 400)
+        self.assertFalse(res.get_json()["success"])
+
+    def test_custom_llm_bridge_streams_sse_contract(self):
+        """
+        Verify the Custom LLM bridge returns the SSE format the Convo AI Engine
+        requires: chat.completion.chunk objects terminated by a [DONE] sentinel.
+
+        Algorithm:
+        1. POST an OpenAI-style messages array to /chat/completions.
+        2. Assert the response content type is text/event-stream.
+        3. Parse the streamed chunks and assert object type and finish_reason.
+        4. Assert the terminating [DONE] sentinel is present.
+        """
+        response = self.app.post(
+            "/chat/completions",
+            json={
+                "model": "echosphere-teaching-agent",
+                "stream": True,
+                "language": "ja",
+                "messages": [
+                    {"role": "system", "content": "You are the tandem co-teacher."},
+                    {"role": "user", "content": "一期一会ですね！"},
+                ],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("text/event-stream", response.content_type)
+
+        body = response.get_data(as_text=True)
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.strip().split("\n\n")
+            if line.startswith("data: ") and not line.endswith("[DONE]")
+        ]
+
+        self.assertGreaterEqual(len(chunks), 2)
+        for chunk in chunks:
+            self.assertEqual(chunk["object"], "chat.completion.chunk")
+            self.assertEqual(chunk["choices"][0]["index"], 0)
+
+        # First chunk carries assistant content, final chunk closes with finish_reason
+        self.assertEqual(chunks[0]["choices"][0]["delta"]["role"], "assistant")
+        self.assertTrue(chunks[0]["choices"][0]["delta"]["content"])
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_custom_llm_bridge_reuses_teaching_agent(self):
+        """
+        Verify the bridge routes through TeachingAgent (REQ-11) rather than a separate
+        reasoning path, by asserting the Japanese idiom scaffolding is produced.
+        """
+        with patch.object(
+            server_instance.agent,
+            "process_turn",
+            wraps=server_instance.agent.process_turn
+        ) as spy:
+            self.app.post(
+                "/chat/completions",
+                json={
+                    "language": "ja",
+                    "messages": [{"role": "user", "content": "一期一会ですね！"}],
+                },
+            )
+
+        spy.assert_called_once()
+        self.assertEqual(spy.call_args[1]["text"], "一期一会ですね！")
+        self.assertEqual(spy.call_args[1]["detected_language"], "ja")
+
+    def test_custom_llm_bridge_handles_content_parts(self):
+        """
+        Verify the bridge accepts OpenAI content-part arrays as well as plain strings.
+        """
+        response = self.app.post(
+            "/chat/completions",
+            json={
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "नमस्ते"}]}
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("data: [DONE]", response.get_data(as_text=True))
+
+
+if __name__ == '__main__':
+    unittest.main()
