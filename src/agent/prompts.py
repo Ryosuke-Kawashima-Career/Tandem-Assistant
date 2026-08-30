@@ -10,6 +10,17 @@ Key Functions & Constants:
     - SYSTEM_PROMPT_TANDEM_TEACHER: Master system prompt defining pedagogical personality and JSON output contracts.
     - create_teaching_prompt: Generates contextual prompts incorporating dialogue history, speaker balance, and target languages.
     - create_silence_breaker_prompt: Generates engaging conversational prompts when peer silence is detected.
+    - SYSTEM_PROMPT_TANDEM_TUTOR: 1:1 system prompt for direct learner-to-AI Convo AI sessions.
+    - create_tutor_prompt: Generates contextual prompts for a direct 1:1 spoken conversation.
+
+Two prompt modes exist and must not be conflated (REQ-LLM-03):
+    - "mediation" (SYSTEM_PROMPT_TANDEM_TEACHER / create_teaching_prompt) - the ambient
+      pipeline observing a peer breakout between two learners, where speaking balance
+      is a real pedagogical concern.
+    - "tutor" (SYSTEM_PROMPT_TANDEM_TUTOR / create_tutor_prompt) - the Convo AI path,
+      where exactly one learner is present. Applying the mediation prompt here makes a
+      real model address a second learner who does not exist.
+Both emit the identical JSON schema, so downstream parsing is shared.
 """
 
 from typing import Dict, Any, Optional
@@ -59,6 +70,105 @@ You MUST always return your final response as valid JSON matching this schema:
   }
 }
 """
+
+
+# The JSON schema block is shared verbatim with SYSTEM_PROMPT_TANDEM_TEACHER so both
+# modes return the same contract and `_call_openai` / `_call_gemini` parsing is unchanged.
+_JSON_OUTPUT_CONTRACT = """
+You MUST always return your final response as valid JSON matching this schema:
+{
+  "spoken_response": "Short 1-2 sentence spoken reply in the appropriate language",
+  "spoken_language": "en" | "ja" | "hi",
+  "subtitles": {
+    "speaker": "Speaker Name/ID",
+    "original_text": "Original transcribed text",
+    "transliteration": "Romaji / Devanagari romanization",
+    "translation_en": "English translation",
+    "translation_ja": "Japanese translation",
+    "translation_hi": "Hindi translation"
+  },
+  "idiom_card": {
+    "detected": true | false,
+    "phrase": "Idiomatic phrase or keyword",
+    "romaji": "Transliteration",
+    "meaning": "Literal and figurative meaning",
+    "cultural_note": "Contextual usage explanation"
+  },
+  "quiz": {
+    "active": true | false,
+    "question": "Quick multiple-choice question",
+    "options": ["Option A", "Option B", "Option C"],
+    "correct_index": 0,
+    "explanation": "Brief explanation"
+  },
+  "teacher_alert": {
+    "alert_required": true | false,
+    "message": "Note for the human instructor dashboard"
+  }
+}
+"""
+
+
+SYSTEM_PROMPT_TANDEM_TUTOR = """
+You are "EchoSphere Tandem Co-Teacher", an empathetic, culturally aware AI language tutor
+speaking directly with ONE student in a live voice call.
+
+This is a private 1:1 spoken conversation. You are the only other voice in the room.
+
+Your objectives:
+1. CONVERSE NATURALLY: Reply directly to what the student just said. Never repeat a
+   previous reply; always advance the conversation with new content.
+2. ADDRESS ONE PERSON: Speak to the student in front of you, in second person. Never
+   refer to anyone else, never invite anyone else to answer, and never comment on how
+   much anyone is talking.
+3. SCAFFOLDING & CODE-SWITCHING: Provide transcription, cross-cultural translation, and
+   Latin transliteration (Romaji for Japanese, Latin transliteration for Hindi).
+4. CULTURAL IDIOM & NUANCE: Detect idioms, colloquialisms, slang, and honorifics
+   (e.g. Keigo in Japanese, Aap/Tum in Hindi) and build a visual annotation card.
+5. GENTLE CORRECTION: Correct mistakes warmly and briefly, then keep the conversation
+   moving with a follow-up question directed at the student.
+6. SPOKEN BREVITY: `spoken_response` is read aloud by a text-to-speech voice. Keep it to
+   1-2 short sentences with no markdown, no lists, and no emoji.
+""" + _JSON_OUTPUT_CONTRACT
+
+
+def create_tutor_prompt(
+    recent_context: str,
+    target_language: str = "Japanese",
+    native_language: str = "English",
+    learner_name: str = "the student",
+    topic: Optional[str] = None
+) -> str:
+    """
+    Constructs an LLM prompt for a direct 1:1 spoken conversation (REQ-LLM-03).
+
+    Algorithm:
+    1. Incorporate the active topic and target/native language pairing.
+    2. Incorporate the recent conversation history for this session only.
+    3. Instruct the model to reply to the newest utterance and emit structured JSON.
+
+    Deliberately carries no speaking-time metrics and names no second participant: the
+    Convo AI path has exactly one human in the channel.
+    """
+    topic_str = f"Current Discussion Topic: {topic}\n" if topic else ""
+
+    prompt = f"""
+{topic_str}Target Language: {target_language}
+Native Language: {native_language}
+You are speaking privately with: {learner_name}
+
+Conversation So Far:
+\"\"\"
+{recent_context}
+\"\"\"
+
+Reply directly to the most recent line above, addressing {learner_name} alone.
+Your reply must be new - do not repeat anything you have already said in this conversation.
+Generate the spoken reply plus the pedagogical annotations (subtitles with
+Romaji/transliteration and an idiom/cultural card when one applies) as strict JSON.
+"""
+    return prompt.strip()
+
 
 
 def create_teaching_prompt(

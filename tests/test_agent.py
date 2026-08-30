@@ -41,13 +41,17 @@ print(f'🔊 AI Spoken Response Synthesized: {len(spoken_audio)} bytes PCM')
 
 """
 
+import os
 import unittest
 import json
+from unittest.mock import patch
 from src.agent.orchestrator import TeachingAgent
 from src.agent.prompts import (
     create_teaching_prompt,
+    create_tutor_prompt,
     create_silence_breaker_prompt,
-    SYSTEM_PROMPT_TANDEM_TEACHER
+    SYSTEM_PROMPT_TANDEM_TEACHER,
+    SYSTEM_PROMPT_TANDEM_TUTOR
 )
 from src.audio.tts_synthesizer import TTSSynthesizer
 
@@ -204,6 +208,116 @@ class TestAgent(unittest.TestCase):
         balance = self.agent.get_speaker_balance_percentages()
         self.assertEqual(balance["Kenji"], 75)
         self.assertEqual(balance["Aarav"], 25)
+
+    def test_tutor_prompt_addresses_exactly_one_learner(self):
+        """
+        Verify the 1:1 tutor prompt carries no peer-mediation framing (REQ-LLM-03).
+
+        Applied to a Convo AI session, the mediation prompt makes a real model faithfully
+        address a second learner who is not in the channel - the same defect visible in
+        the mediation mock's "What do both of you think about this topic?".
+        """
+        prompt = create_tutor_prompt(
+            recent_context="[Kenji (ja)]: 一期一会ですね",
+            target_language="Japanese",
+            native_language="English",
+            learner_name="Kenji",
+            topic="Traditional Japanese Concepts"
+        )
+        combined = (prompt + SYSTEM_PROMPT_TANDEM_TUTOR).lower()
+
+        for banned in [
+            "both of you",
+            "both learners",
+            "speaker balance",
+            "speaking balance",
+            "speaker stats",
+            "the other learner",
+            "two learners",
+            "peer",
+        ]:
+            self.assertNotIn(banned, combined, f"tutor prompt must not mention {banned!r}")
+
+        # Still carries the context a 1:1 reply needs
+        self.assertIn("Target Language: Japanese", prompt)
+        self.assertIn("Kenji", prompt)
+        self.assertIn("一期一会ですね", prompt)
+
+    def test_mediation_prompt_is_unchanged_by_tutor_mode(self):
+        """
+        Verify the ambient peer-mediation prompt still carries speaker-balance framing,
+        so REQ-04's pipeline is untouched by the Convo AI work.
+        """
+        self.assertIn("MULTI-SPEAKER BALANCE", SYSTEM_PROMPT_TANDEM_TEACHER)
+        prompt = create_teaching_prompt(
+            recent_context="[Kenji (ja)]: はい",
+            speaker_stats={"Kenji": 70, "Aarav": 30}
+        )
+        self.assertIn("Speaker Balance Metrics", prompt)
+
+    def test_tutor_mode_reply_does_not_address_a_second_learner(self):
+        """
+        Verify mode="tutor" produces a 1:1 offline reply, so the demo path stops saying
+        "What do both of you think about this topic?" into a private conversation.
+        """
+        response = self.agent.process_turn(
+            speaker_id="Kenji",
+            text="I visited Kyoto last spring.",
+            detected_language="en",
+            mode="tutor"
+        )
+
+        spoken = response["spoken_response"].lower()
+        self.assertTrue(spoken)
+        self.assertNotIn("both of you", spoken)
+        self.assertNotIn("both", spoken)
+
+        # Same JSON contract as mediation mode, so downstream parsing is unchanged
+        for key in ["spoken_response", "spoken_language", "subtitles", "idiom_card", "quiz", "teacher_alert"]:
+            self.assertIn(key, response)
+
+    def test_mediation_mode_is_the_default(self):
+        """
+        Verify process_turn still defaults to mediation, so every existing ambient-pipeline
+        caller keeps its previous behaviour without passing `mode`.
+        """
+        response = self.agent.process_turn(
+            speaker_id="Kenji",
+            text="A regular English sentence.",
+            detected_language="en"
+        )
+        self.assertIn("both of you", response["spoken_response"].lower())
+
+    def test_reset_state_clears_conversation_history(self):
+        """
+        Verify reset_state clears per-session buffers (REQ-LLM-05) without rebuilding the
+        agent, so provider SDK clients are not re-created per session.
+        """
+        self.agent.process_turn(speaker_id="Kenji", text="Hello", detected_language="en")
+        self.agent.update_speaker_time("Kenji", 5000)
+        self.assertTrue(self.agent.turn_history)
+
+        self.agent.reset_state()
+
+        self.assertEqual(self.agent.turn_history, [])
+        self.assertEqual(self.agent.speaker_durations_ms, {})
+
+    def test_unusable_engine_downgrades_to_mock_with_a_warning(self):
+        """
+        Verify a requested engine without credentials degrades to mock and says so
+        (REQ-LLM-01), rather than silently looking identical to a hardcoded stub.
+        """
+        # Blank the key explicitly: a developer machine may hold a real GEMINI_API_KEY
+        # in its shell environment, which would make this a live-credential test.
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}):
+            with self.assertLogs("echosphere.agent.orchestrator", level="WARNING") as captured:
+                agent = TeachingAgent(engine="gemini")
+
+        self.assertEqual(agent.engine, "mock")
+        self.assertTrue(
+            any("Falling back to engine 'mock'" in line for line in captured.output),
+            f"expected a downgrade warning, got: {captured.output}"
+        )
 
     def test_tts_synthesizer_pcm_generation(self):
         """

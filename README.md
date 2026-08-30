@@ -216,6 +216,13 @@ uv run pytest tests/test_audio.py -v
 uv run python -c "import src.audio.vad_processor, src.audio.stt_transcriber, src.rtc.agora_client; print('All core modules imported successfully')"
 ```
 
+How to run the system:
+
+```powershell
+ngrok http 8000
+uv run python -m src.server
+```
+
 ---
 
 ## 9. License & Attribution

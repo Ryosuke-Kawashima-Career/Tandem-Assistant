@@ -24,7 +24,7 @@ from src.rtc.convoai_client import (
     AGENT_STATUS_STOPPED,
 )
 from src.rtc.agora_client import is_usable_credential
-from src.server import app, server_instance
+from src.server import app, server_instance, FALLBACK_REPLIES
 
 # Realistic Agora credential format: 32 hexadecimal characters.
 VALID_APP_ID = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
@@ -328,6 +328,11 @@ class TestConvoAIEndpoints(unittest.TestCase):
         """Initialize the Flask test client and clear any residual agent sessions."""
         self.app = app.test_client()
         server_instance.convoai.active_sessions.clear()
+        # Session context now outlives a single request (REQ-LLM-02), so it must be
+        # cleared between tests or a language captured by one test leaks into the next.
+        server_instance.convoai_session_context.clear()
+        server_instance._convoai_last_channel = None
+        server_instance.agent.reset_state()
 
     def test_module_singleton_never_hits_real_agora_api(self):
         """
@@ -525,6 +530,175 @@ class TestConvoAIEndpoints(unittest.TestCase):
         spy.assert_called_once()
         self.assertEqual(spy.call_args[1]["text"], "一期一会ですね！")
         self.assertEqual(spy.call_args[1]["detected_language"], "ja")
+
+    def test_session_language_reaches_the_agent_without_a_request_field(self):
+        """
+        Verify the language chosen at /api/convoai/start reaches process_turn (REQ-LLM-02).
+
+        Agora's Custom LLM request body is OpenAI-shaped and carries no `language` field,
+        so a bridge reading data.get("language", "en") always resolved to English - the
+        learner's choice never reached the model. The session context must supply it.
+        """
+        self.app.post("/api/convoai/start", json={"language": "ja"})
+
+        with patch.object(
+            server_instance.agent,
+            "process_turn",
+            wraps=server_instance.agent.process_turn
+        ) as spy:
+            self.app.post(
+                "/chat/completions",
+                json={
+                    "model": "echosphere-teaching-agent",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "Hello there"}],
+                },
+            )
+
+        spy.assert_called_once()
+        self.assertEqual(spy.call_args[1]["detected_language"], "ja")
+
+    def test_request_language_overrides_session_context(self):
+        """
+        Verify an explicit request field still wins, so direct/manual calls can drive the
+        bridge without a live Convo AI session.
+        """
+        self.app.post("/api/convoai/start", json={"language": "ja"})
+
+        with patch.object(
+            server_instance.agent,
+            "process_turn",
+            wraps=server_instance.agent.process_turn
+        ) as spy:
+            self.app.post(
+                "/chat/completions",
+                json={
+                    "language": "hi",
+                    "messages": [{"role": "user", "content": "नमस्ते"}],
+                },
+            )
+
+        self.assertEqual(spy.call_args[1]["detected_language"], "hi")
+
+    def test_session_speaker_id_reaches_the_agent(self):
+        """Verify speaker_id resolves from session context too, not a permanent default."""
+        self.app.post("/api/convoai/start", json={"language": "en", "speaker_id": "Kenji"})
+
+        with patch.object(
+            server_instance.agent,
+            "process_turn",
+            wraps=server_instance.agent.process_turn
+        ) as spy:
+            self.app.post(
+                "/chat/completions",
+                json={"messages": [{"role": "user", "content": "Good morning"}]},
+            )
+
+        self.assertEqual(spy.call_args[1]["speaker_id"], "Kenji")
+
+    def test_bridge_runs_the_agent_in_tutor_mode(self):
+        """
+        Verify the Convo AI path selects the 1:1 tutor prompt mode (REQ-LLM-03) rather
+        than the peer-mediation prompt, which addresses a second learner who is absent.
+        """
+        with patch.object(
+            server_instance.agent,
+            "process_turn",
+            wraps=server_instance.agent.process_turn
+        ) as spy:
+            self.app.post(
+                "/chat/completions",
+                json={"messages": [{"role": "user", "content": "Hello"}]},
+            )
+
+        self.assertEqual(spy.call_args[1]["mode"], "tutor")
+
+    def test_second_session_on_same_channel_starts_from_clean_history(self):
+        """
+        Verify conversation state does not leak between sessions (REQ-LLM-05).
+
+        server_instance.agent is a single process-wide TeachingAgent whose turn_history
+        previously accumulated across every session and channel, so a second learner
+        inherited the first learner's dialogue as model context.
+        """
+        self.app.post("/api/convoai/start", json={"language": "ja"})
+        self.app.post(
+            "/chat/completions",
+            json={"messages": [{"role": "user", "content": "一期一会ですね！"}]},
+        )
+        self.assertGreater(len(server_instance.agent.turn_history), 0)
+
+        self.app.post("/api/convoai/stop", json={})
+        self.app.post("/api/convoai/start", json={"language": "ja"})
+
+        self.assertEqual(server_instance.agent.turn_history, [])
+        self.assertEqual(server_instance.agent.speaker_durations_ms, {})
+
+    def test_bridge_streams_reply_in_multiple_content_chunks(self):
+        """
+        Verify reply text is emitted incrementally (REQ-LLM-06) rather than as one blob
+        after the whole model response is assembled, so time-to-first-chunk stays low.
+        """
+        response = self.app.post(
+            "/chat/completions",
+            json={
+                "language": "en",
+                "messages": [{"role": "user", "content": "Tell me about festivals"}],
+            },
+        )
+
+        body = response.get_data(as_text=True)
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.strip().split("\n\n")
+            if line.startswith("data: ") and not line.endswith("[DONE]")
+        ]
+        content_chunks = [
+            c for c in chunks if c["choices"][0]["delta"].get("content")
+        ]
+
+        # More than one content delta means text is going out as it becomes available.
+        self.assertGreater(len(content_chunks), 1)
+        # Concatenated deltas must reconstruct the full reply the engine will speak.
+        joined = "".join(c["choices"][0]["delta"]["content"] for c in content_chunks)
+        self.assertTrue(joined.strip())
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_bridge_speaks_a_fallback_reply_when_the_engine_stalls(self):
+        """
+        Verify a slow or failing reasoning engine still produces speech (Task 5.2).
+
+        Silence here is not neutral: the Convo AI Engine terminates an agent on
+        idle_timeout (default 30s), so a hung model call ends the whole conversation.
+        """
+        with patch.object(
+            server_instance,
+            "process_convoai_turn",
+            side_effect=RuntimeError("provider exploded")
+        ):
+            response = self.app.post(
+                "/chat/completions",
+                json={
+                    "language": "en",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+        # Reassemble the deltas: the fallback line is split across SSE chunks like
+        # any other reply, so it is not findable as one substring in the raw stream.
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.strip().split("\n\n")
+            if line.startswith("data: ") and not line.endswith("[DONE]")
+        ]
+        joined = "".join(
+            c["choices"][0]["delta"].get("content", "") for c in chunks
+        )
+        self.assertEqual(joined, FALLBACK_REPLIES["en"])
 
     def test_custom_llm_bridge_handles_content_parts(self):
         """
