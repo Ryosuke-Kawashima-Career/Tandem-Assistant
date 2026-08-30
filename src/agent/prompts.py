@@ -12,6 +12,8 @@ Key Functions & Constants:
     - create_silence_breaker_prompt: Generates engaging conversational prompts when peer silence is detected.
     - SYSTEM_PROMPT_TANDEM_TUTOR: 1:1 system prompt for direct learner-to-AI Convo AI sessions.
     - create_tutor_prompt: Generates contextual prompts for a direct 1:1 spoken conversation.
+    - SYSTEM_PROMPT_TANDEM_TUTOR_VOICE: 1:1 system prompt for the low-latency voice reply.
+    - create_tutor_voice_prompt: Generates the voice-critical fast-path prompt.
 
 Two prompt modes exist and must not be conflated (REQ-LLM-03):
     - "mediation" (SYSTEM_PROMPT_TANDEM_TEACHER / create_teaching_prompt) - the ambient
@@ -21,6 +23,13 @@ Two prompt modes exist and must not be conflated (REQ-LLM-03):
       where exactly one learner is present. Applying the mediation prompt here makes a
       real model address a second learner who does not exist.
 Both emit the identical JSON schema, so downstream parsing is shared.
+
+The tutor mode is further split by latency (REQ-LAT-02):
+    - The *_VOICE pair generates only the spoken reply, as plain text, and is the call
+      the student actually waits on. Plain text is what makes token-level streaming
+      safe - a half-generated JSON object cannot be spoken aloud.
+    - create_tutor_prompt (the JSON contract) still generates subtitles, idiom cards, and
+      quizzes, but now runs off the voice-critical path so it no longer gates speech.
 """
 
 from typing import Dict, Any, Optional
@@ -169,6 +178,65 @@ Romaji/transliteration and an idiom/cultural card when one applies) as strict JS
 """
     return prompt.strip()
 
+
+
+SYSTEM_PROMPT_TANDEM_TUTOR_VOICE = """
+You are "EchoSphere Tandem Co-Teacher", an empathetic, culturally aware AI language tutor
+speaking directly with ONE student in a live voice call.
+
+This is a private 1:1 spoken conversation. You are the only other voice in the room.
+
+Your reply is read aloud immediately by a text-to-speech voice, so:
+1. REPLY WITH SPEECH ONLY. Output nothing but the words you want spoken. No markdown, no
+   lists, no emoji, no labels, no quotation marks around the reply, and no code blocks.
+2. BE BRIEF. One or two short sentences. A long reply is a long silence for the student.
+3. ADDRESS ONE PERSON. Speak to the student in front of you, in second person. Never refer
+   to anyone else, never invite anyone else to answer, and never comment on how much
+   anyone is talking.
+4. ADVANCE THE CONVERSATION. Reply directly to what the student just said and never repeat
+   an earlier reply. End with a natural follow-up question when it keeps things moving.
+5. CORRECT GENTLY. Fix mistakes warmly and briefly in passing, then keep talking.
+"""
+
+
+def create_tutor_voice_prompt(
+    recent_context: str,
+    latest_utterance: str,
+    target_language: str = "Japanese",
+    native_language: str = "English",
+    learner_name: str = "the student",
+    topic: Optional[str] = None
+) -> str:
+    """
+    Constructs the voice-critical 1:1 prompt for the low-latency fast path (REQ-LAT-02).
+
+    Algorithm:
+    1. Incorporate the active topic and target/native language pairing.
+    2. Incorporate the recent conversation history for this session only.
+    3. Instruct the model to reply to the newest utterance with speech text alone.
+
+    Deliberately asks for bare text rather than the structured JSON contract used by
+    `create_tutor_prompt`. That is what makes token-level streaming safe (REQ-LAT-03): a
+    partial JSON object is not speakable, so streaming it would make the agent read raw
+    syntax aloud. The scaffolding fields are generated separately, off this path.
+    """
+    topic_str = f"Current Discussion Topic: {topic}\n" if topic else ""
+
+    prompt = f"""
+{topic_str}Target Language: {target_language}
+Native Language: {native_language}
+You are speaking privately with: {learner_name}
+
+Conversation So Far:
+\"\"\"
+{recent_context}
+\"\"\"
+
+{learner_name} just said: "{latest_utterance}"
+
+Reply out loud to {learner_name} now. Output only the words to be spoken.
+"""
+    return prompt.strip()
 
 
 def create_teaching_prompt(

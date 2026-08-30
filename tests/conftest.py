@@ -14,6 +14,17 @@ Summary:
     test suite exercises the simulated Convo AI path even on a developer machine
     whose `.env` holds real, working Agora credentials. Without this, every test run
     would attempt a real POST to Agora's REST API in /api/convoai/start.
+
+    ECHOSPHERE_ENGINE / OPENAI_API_KEY / GEMINI_API_KEY are neutralized for the same
+    reason and by the same mechanism: `TeachingAgent` reads them from the real process
+    environment too, independently of the .env file this module already blocks. A shell
+    that has previously exported real values (e.g. from a manual `uv run python -m
+    src.server` session) makes the suite silently place real, billed calls to a live
+    LLM provider - slow, non-deterministic, and network-dependent. This was the
+    condition that turned a narrow, near-instant race in the Convo AI scaffolding
+    background task (dev/tasks/task_plans/implementation_plan_latency_improvement.md
+    Phase 7) into an easily-hit one: real provider latency gave a leaked future far
+    more time to land inside an unrelated, later test's mock.
 """
 
 import os
@@ -30,3 +41,11 @@ os.environ["AGORA_APP_CERTIFICATE"] = "mock_certificate"
 os.environ["AGORA_CUSTOMER_ID"] = ""
 os.environ["AGORA_CUSTOMER_SECRET"] = ""
 os.environ["CONVOAI_LLM_BASE_URL"] = "http://localhost:8000"
+
+# Force the mock reasoning engine and blank both provider keys, regardless of what a
+# developer's shell happens to have exported. Tests that need a specific engine pass
+# engine=/*_api_key= explicitly as constructor arguments (which override these), or
+# scope their own patch.dict override - neither is weakened by this default.
+os.environ["ECHOSPHERE_ENGINE"] = "mock"
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["GEMINI_API_KEY"] = ""

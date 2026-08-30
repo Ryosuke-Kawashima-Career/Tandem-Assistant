@@ -44,14 +44,20 @@ print(f'🔊 AI Spoken Response Synthesized: {len(spoken_audio)} bytes PCM')
 import os
 import unittest
 import json
-from unittest.mock import patch
-from src.agent.orchestrator import TeachingAgent
+from unittest.mock import patch, MagicMock
+from src.agent.orchestrator import (
+    TeachingAgent,
+    DEFAULT_OPENAI_MODEL,
+    DEFAULT_GEMINI_MODEL,
+)
 from src.agent.prompts import (
     create_teaching_prompt,
     create_tutor_prompt,
+    create_tutor_voice_prompt,
     create_silence_breaker_prompt,
     SYSTEM_PROMPT_TANDEM_TEACHER,
-    SYSTEM_PROMPT_TANDEM_TUTOR
+    SYSTEM_PROMPT_TANDEM_TUTOR,
+    SYSTEM_PROMPT_TANDEM_TUTOR_VOICE
 )
 from src.audio.tts_synthesizer import TTSSynthesizer
 
@@ -326,9 +332,277 @@ class TestAgent(unittest.TestCase):
         """
         speech_text = "素晴らしい会話ですね！ (Wonderful conversation!)"
         pcm_bytes = self.tts.synthesize(speech_text, language="ja")
-        
+
         self.assertIsInstance(pcm_bytes, bytes)
         self.assertGreater(len(pcm_bytes), 0)
+
+
+class TestLatencyFastPath(unittest.TestCase):
+    """
+    Test suite for the low-latency voice reply path (dev/tasks/task_specs/latency_improvement.md).
+
+    Covers REQ-LAT-02 (voice reply decoupled from the structured scaffolding payload),
+    REQ-LAT-03 (provider tokens forwarded as produced), and REQ-LAT-04 (model tier is
+    environment-configurable).
+    """
+
+    def setUp(self):
+        """Initialize a mock-engine agent for the fast-path tests."""
+        self.agent = TeachingAgent(
+            engine="mock",
+            target_language="Japanese",
+            native_language="English"
+        )
+
+    # -- REQ-LAT-02: decoupled fast-path reply -------------------------------------
+
+    def test_voice_prompt_asks_for_plain_text_not_json(self):
+        """
+        Verify the voice-critical prompt does not request the structured JSON payload.
+
+        This is what makes REQ-LAT-03 safe: a partial JSON object cannot be spoken by
+        TTS mid-token, so the streamed call must produce bare reply text.
+        """
+        self.assertNotIn("JSON", SYSTEM_PROMPT_TANDEM_TUTOR_VOICE.upper())
+        for field in ("subtitles", "idiom_card", "quiz", "teacher_alert"):
+            self.assertNotIn(field, SYSTEM_PROMPT_TANDEM_TUTOR_VOICE)
+
+    def test_voice_prompt_addresses_one_learner(self):
+        """
+        Verify the fast path keeps the 1:1 framing REQ-LLM-03 established, so shrinking
+        the payload does not reintroduce peer-mediation language into a private call.
+        """
+        prompt = create_tutor_voice_prompt(
+            recent_context="[Kenji (ja)]: こんにちは",
+            latest_utterance="こんにちは",
+            target_language="Japanese",
+            native_language="English",
+            learner_name="Kenji"
+        )
+        lowered = prompt.lower()
+        self.assertIn("kenji", lowered)
+        self.assertNotIn("both", lowered)
+        self.assertNotIn("speaker balance", lowered)
+
+    def test_generate_spoken_reply_returns_plain_text(self):
+        """
+        Verify the fast path yields speakable text, never a JSON document (REQ-LAT-02).
+        """
+        reply = "".join(
+            self.agent.generate_spoken_reply(
+                speaker_id="Kenji", text="Hello there", detected_language="en"
+            )
+        )
+
+        self.assertTrue(reply.strip())
+        self.assertFalse(reply.lstrip().startswith("{"))
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(reply)
+
+    def test_generate_spoken_reply_yields_incremental_deltas(self):
+        """
+        Verify the fast path is a stream of deltas rather than one finished blob, so the
+        bridge has something to forward before generation completes (REQ-LAT-03).
+        """
+        deltas = list(
+            self.agent.generate_spoken_reply(
+                speaker_id="Kenji", text="Tell me about festivals", detected_language="en"
+            )
+        )
+        self.assertGreater(len(deltas), 1)
+
+    def test_generate_spoken_reply_records_the_learner_turn(self):
+        """
+        Verify the fast path records conversation history itself.
+
+        The scaffolding call is now asynchronous, so if it owned history the next turn's
+        prompt could be built before the previous turn was recorded.
+        """
+        self.agent.generate_spoken_reply(
+            speaker_id="Kenji", text="こんにちは", detected_language="ja"
+        )
+        self.assertEqual(len(self.agent.turn_history), 1)
+        self.assertEqual(self.agent.turn_history[0]["text"], "こんにちは")
+
+    def test_process_turn_can_skip_recording_history(self):
+        """
+        Verify process_turn(record_turn=False) leaves history untouched (REQ-LAT-02).
+
+        The scaffolding call runs after the fast path already recorded the turn; without
+        this flag the same utterance would appear twice in the model's context.
+        """
+        self.agent.generate_spoken_reply(
+            speaker_id="Kenji", text="Hello", detected_language="en"
+        )
+        self.assertEqual(len(self.agent.turn_history), 1)
+
+        self.agent.process_turn(
+            speaker_id="Kenji", text="Hello", detected_language="en",
+            mode="tutor", record_turn=False
+        )
+        self.assertEqual(len(self.agent.turn_history), 1)
+
+    def test_process_turn_still_records_by_default(self):
+        """Verify the mediation pipeline's history behaviour is unchanged (REQ-LAT-02 non-goal)."""
+        self.agent.process_turn(speaker_id="Kenji", text="Hello", detected_language="en")
+        self.assertEqual(len(self.agent.turn_history), 1)
+
+    # -- REQ-LAT-03: true token-level streaming ------------------------------------
+
+    def test_openai_fast_path_forwards_provider_deltas(self):
+        """
+        Verify OpenAI deltas are forwarded one by one rather than joined and re-split.
+        """
+        agent = TeachingAgent(engine="openai", openai_api_key="test-key")
+        agent.engine = "openai"
+
+        def fake_stream(*args, **kwargs):
+            self.assertTrue(kwargs.get("stream"), "fast path must request a streaming response")
+            for piece in ["Hello", " there", ", Kenji!"]:
+                chunk = MagicMock()
+                chunk.choices = [MagicMock(delta=MagicMock(content=piece))]
+                yield chunk
+
+        agent._openai_client = MagicMock()
+        agent._openai_client.chat.completions.create.side_effect = fake_stream
+
+        deltas = list(
+            agent.generate_spoken_reply(
+                speaker_id="Kenji", text="Hi", detected_language="en"
+            )
+        )
+        self.assertEqual(deltas, ["Hello", " there", ", Kenji!"])
+
+    def test_gemini_fast_path_forwards_provider_deltas(self):
+        """
+        Verify Gemini deltas are forwarded incrementally through the streaming API.
+        """
+        agent = TeachingAgent(engine="gemini", gemini_api_key="test-key")
+        agent.engine = "gemini"
+
+        def fake_stream(*args, **kwargs):
+            for piece in ["こんにちは", "、ケンジさん"]:
+                chunk = MagicMock()
+                chunk.text = piece
+                yield chunk
+
+        agent._gemini_client = MagicMock()
+        agent._gemini_client.models.generate_content_stream.side_effect = fake_stream
+
+        deltas = list(
+            agent.generate_spoken_reply(
+                speaker_id="Kenji", text="やあ", detected_language="ja"
+            )
+        )
+        self.assertEqual(deltas, ["こんにちは", "、ケンジさん"])
+
+    def test_fast_path_falls_back_to_mock_text_on_provider_error(self):
+        """
+        Verify a provider failure still yields speakable text.
+
+        Silence is not neutral on this path: the Convo AI Engine terminates an agent on
+        idle_timeout, so a raised exception mid-stream would end the conversation.
+        """
+        agent = TeachingAgent(engine="openai", openai_api_key="test-key")
+        agent.engine = "openai"
+        agent._openai_client = MagicMock()
+        agent._openai_client.chat.completions.create.side_effect = RuntimeError("provider down")
+
+        with self.assertLogs("echosphere.agent.orchestrator", level="WARNING"):
+            reply = "".join(
+                agent.generate_spoken_reply(
+                    speaker_id="Kenji", text="Hi", detected_language="en"
+                )
+            )
+        self.assertTrue(reply.strip())
+
+    # -- REQ-LAT-04: lightweight model configuration -------------------------------
+
+    def test_openai_model_is_environment_configurable(self):
+        """Verify the OpenAI model id is read from ECHOSPHERE_OPENAI_MODEL (REQ-LAT-04)."""
+        with patch.dict(os.environ, {"ECHOSPHERE_OPENAI_MODEL": "gpt-test-tiny"}):
+            agent = TeachingAgent(engine="openai", openai_api_key="test-key")
+        self.assertEqual(agent.openai_model, "gpt-test-tiny")
+
+    def test_gemini_model_is_environment_configurable(self):
+        """Verify the Gemini model id is read from ECHOSPHERE_GEMINI_MODEL (REQ-LAT-04)."""
+        with patch.dict(os.environ, {"ECHOSPHERE_GEMINI_MODEL": "gemini-test-tiny"}):
+            agent = TeachingAgent(engine="gemini", gemini_api_key="test-key")
+        self.assertEqual(agent.gemini_model, "gemini-test-tiny")
+
+    def test_default_models_are_the_lightweight_tiers(self):
+        """
+        Verify the defaults are the documented low-latency tiers, not the previously
+        hardcoded gpt-4o / gemini-2.5-flash (D-LAT-2).
+        """
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ECHOSPHERE_OPENAI_MODEL", None)
+            os.environ.pop("ECHOSPHERE_GEMINI_MODEL", None)
+            agent = TeachingAgent(engine="mock")
+
+        self.assertEqual(agent.openai_model, DEFAULT_OPENAI_MODEL)
+        self.assertEqual(agent.gemini_model, DEFAULT_GEMINI_MODEL)
+        self.assertNotEqual(agent.openai_model, "gpt-4o")
+        self.assertNotEqual(agent.gemini_model, "gemini-2.5-flash")
+
+    def test_scaffolding_uses_a_separate_model_from_the_voice_path(self):
+        """
+        Verify the structured JSON call can run on a stronger model than the voice path.
+
+        Observed live on 2026-08-30: the lightweight tier chosen for latency produces
+        malformed JSON for the scaffolding contract often enough to matter ("Expecting
+        property name enclosed in double quotes"). Scaffolding is no longer
+        latency-critical after REQ-LAT-02, so it does not have to pay the fast tier's
+        accuracy cost - this is the Risk 3 mitigation from the implementation plan.
+        """
+        agent = TeachingAgent(engine="mock")
+        self.assertNotEqual(agent.gemini_scaffolding_model, agent.gemini_model)
+        self.assertNotEqual(agent.openai_scaffolding_model, agent.openai_model)
+
+    def test_scaffolding_models_are_environment_configurable(self):
+        """Verify both scaffolding model ids are independently overridable."""
+        with patch.dict(os.environ, {
+            "ECHOSPHERE_OPENAI_SCAFFOLDING_MODEL": "gpt-test-big",
+            "ECHOSPHERE_GEMINI_SCAFFOLDING_MODEL": "gemini-test-big",
+        }):
+            agent = TeachingAgent(engine="mock")
+        self.assertEqual(agent.openai_scaffolding_model, "gpt-test-big")
+        self.assertEqual(agent.gemini_scaffolding_model, "gemini-test-big")
+
+    def test_structured_call_uses_the_scaffolding_model(self):
+        """
+        Verify the JSON path sends the scaffolding model, not the fast voice model.
+        """
+        agent = TeachingAgent(engine="gemini", gemini_api_key="test-key")
+        agent.engine = "gemini"
+        agent.gemini_model = "gemini-fast"
+        agent.gemini_scaffolding_model = "gemini-strong"
+        agent._gemini_client = MagicMock()
+        agent._gemini_client.models.generate_content.return_value = MagicMock(
+            text='{"spoken_response": "hi"}'
+        )
+
+        agent.process_turn(
+            speaker_id="Kenji", text="Hello", detected_language="en", mode="tutor"
+        )
+
+        kwargs = agent._gemini_client.models.generate_content.call_args[1]
+        self.assertEqual(kwargs["model"], "gemini-strong")
+
+    def test_configured_model_reaches_the_provider_call(self):
+        """Verify the configured model id is what is actually sent to the provider."""
+        agent = TeachingAgent(engine="openai", openai_api_key="test-key")
+        agent.engine = "openai"
+        agent.openai_model = "gpt-test-tiny"
+        agent._openai_client = MagicMock()
+        agent._openai_client.chat.completions.create.return_value = iter(())
+
+        list(agent.generate_spoken_reply(
+            speaker_id="Kenji", text="Hi", detected_language="en"
+        ))
+
+        kwargs = agent._openai_client.chat.completions.create.call_args[1]
+        self.assertEqual(kwargs["model"], "gpt-test-tiny")
 
 
 if __name__ == '__main__':

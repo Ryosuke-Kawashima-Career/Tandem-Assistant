@@ -100,11 +100,18 @@ export class ConvoAITranscriptService {
 
       this.voiceAI.on(AgoraVoiceAIEvents.AGENT_STATE_CHANGED, (agentUserId, event) => {
         this._emit('agentState', event?.state, agentUserId);
+        this._relayToServer(channel, 'agent_state', { state: event?.state, agentUserId });
       });
 
       this.voiceAI.on(AgoraVoiceAIEvents.AGENT_ERROR, (agentUserId, error) => {
         console.error('[Convo AI agent error]', error);
         this._emit('agentError', error);
+        this._relayToServer(channel, 'agent_error', {
+          module: error?.module,
+          code: error?.code,
+          message: error?.message || String(error),
+          agentUserId
+        });
       });
 
       // Step 5: RTM channel name mirrors the RTC channel name
@@ -116,6 +123,32 @@ export class ConvoAITranscriptService {
       console.error('Failed to subscribe to Convo AI transcripts:', err);
       await this.disconnect();
       return false;
+    }
+  }
+
+  /**
+   * Forwards an agent lifecycle or error event to the backend log (REQ-LLM-10).
+   *
+   * These events arrive over RTM and would otherwise reach the browser console only,
+   * leaving the operator debugging from the terminal unable to tell a failing agent
+   * from a healthy one that simply has nothing to say.
+   *
+   * Fire-and-forget on purpose: this runs inside an error handler, so a failed
+   * diagnostic POST must never mask or replace the fault it is reporting.
+   *
+   * @param {string} channel - RTC channel the event belongs to
+   * @param {string} type - 'agent_state' or 'agent_error'
+   * @param {Object} payload - Event details forwarded verbatim
+   */
+  _relayToServer(channel, type, payload) {
+    try {
+      fetch('/api/convoai/event', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel, type, payload })
+      }).catch(() => {});
+    } catch (err) {
+      // Intentionally swallowed - see the fire-and-forget note above.
     }
   }
 

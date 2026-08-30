@@ -14,17 +14,42 @@ Key Classes:
 
 import os
 import json
+import time
 import logging
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Iterator
 from src.agent.prompts import (
     SYSTEM_PROMPT_TANDEM_TEACHER,
     SYSTEM_PROMPT_TANDEM_TUTOR,
+    SYSTEM_PROMPT_TANDEM_TUTOR_VOICE,
     create_teaching_prompt,
     create_tutor_prompt,
+    create_tutor_voice_prompt,
     create_silence_breaker_prompt
 )
 
 logger = logging.getLogger("echosphere.agent.orchestrator")
+
+# Default reasoning models (REQ-LAT-04). Both are the vendors' current lowest-latency
+# conversational tiers, chosen because the student is waiting in a live voice call:
+# the previously hardcoded gpt-4o / gemini-2.5-flash are stronger but measurably slower
+# to first token, and time-to-first-token is what this path is optimised for (D-LAT-2).
+#
+# These are overridable via ECHOSPHERE_OPENAI_MODEL / ECHOSPHERE_GEMINI_MODEL precisely
+# because model names and their relative speed change independently of this repo - check
+# the current provider matrix rather than trusting these constants indefinitely.
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
+
+# Models for the structured scaffolding call (subtitles, idiom card, quiz). Deliberately
+# stronger than the voice tiers above: since REQ-LAT-02 this call no longer blocks
+# speech, so it does not have to pay the fast tier's accuracy cost.
+#
+# This is not hypothetical. A live run on 2026-08-30 with gemini-3.5-flash-lite failed
+# to parse the scaffolding contract - "Expecting property name enclosed in double
+# quotes" - and fell back to canned cards. The fast tiers are tuned for conversational
+# text, not for emitting a 5-block JSON schema without drift.
+DEFAULT_OPENAI_SCAFFOLDING_MODEL = "gpt-5.4"
+DEFAULT_GEMINI_SCAFFOLDING_MODEL = "gemini-3.5-flash"
 
 try:
     from openai import OpenAI
@@ -68,6 +93,22 @@ class TeachingAgent:
         
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
+
+        # Model tier per provider (REQ-LAT-04). Resolved once here rather than read at
+        # each call site, which is where the old hardcoded "gpt-4o" / "gemini-2.5-flash"
+        # literals lived and could not be tuned without a code change.
+        self.openai_model = os.getenv("ECHOSPHERE_OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+        self.gemini_model = os.getenv("ECHOSPHERE_GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+
+        # Structured-output models. Separate from the voice tiers because the two calls
+        # optimise for different things: the voice path for time-to-first-token, this
+        # one for emitting a strict JSON schema correctly.
+        self.openai_scaffolding_model = os.getenv(
+            "ECHOSPHERE_OPENAI_SCAFFOLDING_MODEL", DEFAULT_OPENAI_SCAFFOLDING_MODEL
+        )
+        self.gemini_scaffolding_model = os.getenv(
+            "ECHOSPHERE_GEMINI_SCAFFOLDING_MODEL", DEFAULT_GEMINI_SCAFFOLDING_MODEL
+        )
 
         # Step 2: Initialize Provider Clients
         requested_engine = self.engine
@@ -181,13 +222,14 @@ class TeachingAgent:
         text: str,
         detected_language: str = "ja",
         topic: Optional[str] = None,
-        mode: str = "mediation"
+        mode: str = "mediation",
+        record_turn: bool = True
     ) -> Dict[str, Any]:
         """
         Processes a newly transcribed student turn and generates real-time pedagogical scaffolding.
 
         Algorithm:
-        1. Append the turn to the internal history buffer.
+        1. Append the turn to the internal history buffer (unless already recorded).
         2. Retrieve current speaker balance metrics.
         3. Construct the prompt for the requested mode.
         4. Route to LLM backend (OpenAI, Gemini, or Mock).
@@ -199,13 +241,18 @@ class TeachingAgent:
         - "mediation": two peers in a breakout, where speaking balance matters.
         - "tutor": a 1:1 Convo AI conversation with exactly one learner present.
         Both modes return the identical JSON contract, so downstream parsing is shared.
+
+        `record_turn=False` is used by the Convo AI scaffolding call (REQ-LAT-02), which
+        runs *after* `generate_spoken_reply` already recorded the same utterance. Without
+        it the learner would appear in the model's context saying everything twice.
         """
         # Step 1: Record turn
-        self.turn_history.append({
-            "speaker": speaker_id,
-            "text": text,
-            "lang": detected_language
-        })
+        if record_turn:
+            self.turn_history.append({
+                "speaker": speaker_id,
+                "text": text,
+                "lang": detected_language
+            })
 
         # Step 2: Compute stats
         stats = self.get_speaker_balance_percentages()
@@ -246,6 +293,175 @@ class TeachingAgent:
             return self._mock_tutor_response(speaker_id, text, detected_language)
         else:
             return self._mock_mediation_response(speaker_id, text, detected_language)
+
+    def generate_spoken_reply(
+        self,
+        speaker_id: str,
+        text: str,
+        detected_language: str = "ja",
+        topic: Optional[str] = None
+    ) -> Iterator[str]:
+        """
+        Streams the spoken 1:1 reply as plain text deltas (REQ-LAT-02 / REQ-LAT-03).
+
+        This is the voice-critical path: everything the student waits on before hearing
+        anything happens here, and nothing else does. The structured scaffolding
+        (subtitles, idiom card, quiz, teacher alert) is generated by a separate
+        `process_turn(mode="tutor", record_turn=False)` call that the caller runs off
+        this path, so a large JSON generation no longer sits between the student
+        finishing a sentence and the agent starting to speak (D-LAT-1, D-LAT-3).
+
+        Algorithm:
+        1. Record the turn in history (this path owns it - see `record_turn`).
+        2. Build the plain-text voice prompt from the conversation so far.
+        3. Stream deltas from the configured provider, or emit the mock reply offline.
+        4. On any provider failure, fall back to speakable canned text rather than
+           raising - silence ends the session via the Engine's idle_timeout.
+
+        Returns:
+            An iterator of successive text fragments. Concatenated, they form the full
+            spoken reply.
+
+        Steps 1 and 2 run eagerly, before any iteration: this is a plain method
+        returning a generator rather than a generator function itself, so recording the
+        turn does not depend on the caller consuming the stream.
+        """
+        # Step 1: This path owns history so the next turn's context is correct even
+        # though the scaffolding call is asynchronous and may not have finished.
+        self.turn_history.append({
+            "speaker": speaker_id,
+            "text": text,
+            "lang": detected_language
+        })
+
+        # Step 2: Build the voice prompt from history *excluding* the utterance itself,
+        # which is passed separately so the model sees clearly what to answer.
+        prompt = create_tutor_voice_prompt(
+            recent_context=self.format_history_context(),
+            latest_utterance=text,
+            target_language=self.target_language,
+            native_language=self.native_language,
+            learner_name=speaker_id,
+            topic=topic
+        )
+
+        def _stream() -> Iterator[str]:
+            started = time.time()
+            emitted_any = False
+
+            # Step 3: Dispatch to the streaming provider leg
+            try:
+                if self.engine in ("openai", "whisper") and self._openai_client:
+                    stream = self._stream_openai(prompt, SYSTEM_PROMPT_TANDEM_TUTOR_VOICE)
+                elif self.engine == "gemini" and self._gemini_client:
+                    stream = self._stream_gemini(prompt, SYSTEM_PROMPT_TANDEM_TUTOR_VOICE)
+                else:
+                    stream = self._mock_spoken_reply_stream(speaker_id, text, detected_language)
+
+                for delta in stream:
+                    if not delta:
+                        continue
+                    if not emitted_any:
+                        emitted_any = True
+                        logger.debug(
+                            "Spoken reply first token in %.3fs (engine=%s, model=%s).",
+                            time.time() - started, self.engine, self._active_model()
+                        )
+                    yield delta
+            except Exception as err:
+                # Step 4: A mid-stream provider failure must still end in speech.
+                logger.warning(
+                    f"Spoken reply stream failed ({err}). "
+                    f"Falling back to a canned reply so the agent does not go silent."
+                )
+                if not emitted_any:
+                    yield self._mock_spoken_reply(speaker_id, text, detected_language)
+                return
+
+            if not emitted_any:
+                logger.warning(
+                    "Reasoning engine produced an empty spoken reply; speaking canned text."
+                )
+                yield self._mock_spoken_reply(speaker_id, text, detected_language)
+                return
+
+            logger.debug("Spoken reply stream completed in %.3fs.", time.time() - started)
+
+        return _stream()
+
+    def _active_model(self) -> str:
+        """Returns the model id in use for the active engine, for log lines."""
+        if self.engine in ("openai", "whisper"):
+            return self.openai_model
+        if self.engine == "gemini":
+            return self.gemini_model
+        return "mock"
+
+    def _stream_openai(self, prompt: str, system_prompt: str) -> Iterator[str]:
+        """
+        Streams plain-text deltas from OpenAI (REQ-LAT-03).
+
+        Separate from `_call_openai` rather than a flag on it: that method is the
+        mediation pipeline's JSON path (REQ-04) and must keep its blocking,
+        `response_format`-constrained behaviour untouched.
+        """
+        response = self._openai_client.chat.completions.create(
+            model=self.openai_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            stream=True
+        )
+        for chunk in response:
+            choices = getattr(chunk, "choices", None)
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            content = getattr(delta, "content", None) if delta is not None else None
+            if content:
+                yield content
+
+    def _stream_gemini(self, prompt: str, system_prompt: str) -> Iterator[str]:
+        """
+        Streams plain-text deltas from Google Gemini (REQ-LAT-03).
+
+        See `_stream_openai` for why this does not reuse `_call_gemini`. No
+        `response_mime_type` is set here: this call must return speech, not JSON.
+        """
+        full_prompt = f"{system_prompt}\n\nUser Request:\n{prompt}"
+        response = self._gemini_client.models.generate_content_stream(
+            model=self.gemini_model,
+            contents=full_prompt
+        )
+        for chunk in response:
+            content = getattr(chunk, "text", None)
+            if content:
+                yield content
+
+    def _mock_spoken_reply(self, speaker_id: str, text: str, lang: str) -> str:
+        """
+        Returns the offline spoken reply for the fast path.
+
+        Reuses the tutor mock's `spoken_response` so offline demos say the same thing on
+        the fast path as they did on the old blocking path.
+        """
+        return self._mock_tutor_response(speaker_id, text, lang).get("spoken_response", "")
+
+    def _mock_spoken_reply_stream(
+        self,
+        speaker_id: str,
+        text: str,
+        lang: str,
+        chunk_size: int = 24
+    ) -> Iterator[str]:
+        """
+        Emits the offline reply as several deltas so the mock path exercises the same
+        incremental contract as a live provider stream.
+        """
+        reply = self._mock_spoken_reply(speaker_id, text, lang)
+        for index in range(0, len(reply), chunk_size):
+            yield reply[index:index + chunk_size]
 
     def generate_silence_breaker(
         self,
@@ -291,9 +507,10 @@ class TeachingAgent:
         unparseable) reply routes through `_fallback_to_mock_response`, which logs the
         downgrade instead of silently returning canned text.
         """
+        started = time.time()
         try:
             response = self._openai_client.chat.completions.create(
-                model="gpt-4o",
+                model=self.openai_scaffolding_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt}
@@ -301,9 +518,16 @@ class TeachingAgent:
                 response_format={"type": "json_object"}
             )
             raw = response.choices[0].message.content
-            return json.loads(raw)
+            result = json.loads(raw)
+            # REQ-LAT-01: attributes a slow turn to model think-time rather than to
+            # bridge overhead or the network, which the bridge-level timing cannot.
+            logger.debug(
+                "OpenAI structured call (%s) took %.3fs.",
+                self.openai_scaffolding_model, time.time() - started
+            )
+            return result
         except Exception as err:
-            logger.error(f"OpenAI agent invocation failed: {err}")
+            logger.error(f"OpenAI agent invocation failed after {time.time() - started:.3f}s: {err}")
             return self._fallback_to_mock_response(
                 f"OpenAI call or JSON parse failed ({err})", mode, speaker_id, text, lang
             )
@@ -323,18 +547,25 @@ class TeachingAgent:
         See `_call_openai` for why the system prompt is a parameter and why failures
         route through `_fallback_to_mock_response`.
         """
+        started = time.time()
         try:
             full_prompt = f"{system_prompt}\n\nUser Request:\n{prompt}"
             response = self._gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=self.gemini_scaffolding_model,
                 contents=full_prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json"
                 )
             )
-            return json.loads(response.text)
+            result = json.loads(response.text)
+            # REQ-LAT-01: see the matching line in _call_openai.
+            logger.debug(
+                "Gemini structured call (%s) took %.3fs.",
+                self.gemini_scaffolding_model, time.time() - started
+            )
+            return result
         except Exception as err:
-            logger.error(f"Gemini agent invocation failed: {err}")
+            logger.error(f"Gemini agent invocation failed after {time.time() - started:.3f}s: {err}")
             return self._fallback_to_mock_response(
                 f"Gemini call or JSON parse failed ({err})", mode, speaker_id, text, lang
             )

@@ -52,6 +52,22 @@ AGENT_STATUS_FAILED = "FAILED"
 # Only the ASR *language codes* are pinned here: they are stable BCP-47 identifiers.
 # Vendor and voice names are deliberately NOT hardcoded - they change independently of
 # this codebase and are resolved from environment configuration per REQ-08.
+# Turn-end detection bounds documented by the Convo AI join schema (REQ-LAT-05).
+# Values outside [120, 2000] are rejected by the API, so they are clamped rather than
+# sent: failing the whole /join call to save a few milliseconds is a bad trade.
+END_OF_SPEECH_SILENCE_MIN_MS = 120
+END_OF_SPEECH_SILENCE_MAX_MS = 2000
+
+# The Engine's own default is 640ms. That silence is spent *before* the Custom LLM
+# bridge is called at all, so it is charged directly against the sub-one-second reply
+# budget and no amount of backend streaming can win it back.
+#
+# 480ms is a deliberate compromise, not the fastest setting available. Language learners
+# hesitate mid-sentence far more than native speakers do - dropping to the 120ms floor
+# would cut them off mid-thought, which is a worse product than a slightly slower reply.
+# Tune per deployment via CONVOAI_END_OF_SPEECH_SILENCE_MS.
+DEFAULT_END_OF_SPEECH_SILENCE_MS = 480
+
 LANGUAGE_PROFILES: Dict[str, Dict[str, str]] = {
     "en": {"asr_language": "en-US", "voice_env": "CONVOAI_TTS_VOICE_EN", "label": "English"},
     "ja": {"asr_language": "ja-JP", "voice_env": "CONVOAI_TTS_VOICE_JA", "label": "Japanese"},
@@ -201,6 +217,35 @@ class ConvoAIClient:
 
         return {"voice_name": voice_name} if voice_name else {}
 
+    def _resolve_end_of_speech_silence_ms(self) -> int:
+        """
+        Resolves the end-of-utterance silence threshold, clamped to the documented range.
+
+        Algorithm:
+        1. Read CONVOAI_END_OF_SPEECH_SILENCE_MS, falling back to the tuned default.
+        2. Treat an unparseable value as the default rather than raising - a typo in
+           `.env` must not stop an agent from starting.
+        3. Clamp into [120, 2000], the range the join schema accepts.
+        """
+        raw = os.getenv("CONVOAI_END_OF_SPEECH_SILENCE_MS", "")
+        try:
+            value = int(raw) if raw else DEFAULT_END_OF_SPEECH_SILENCE_MS
+        except ValueError:
+            logger.warning(
+                f"CONVOAI_END_OF_SPEECH_SILENCE_MS={raw!r} is not an integer. "
+                f"Using the default {DEFAULT_END_OF_SPEECH_SILENCE_MS}ms."
+            )
+            value = DEFAULT_END_OF_SPEECH_SILENCE_MS
+
+        clamped = max(END_OF_SPEECH_SILENCE_MIN_MS, min(END_OF_SPEECH_SILENCE_MAX_MS, value))
+        if clamped != value:
+            logger.warning(
+                f"CONVOAI_END_OF_SPEECH_SILENCE_MS={value} is outside the documented "
+                f"range [{END_OF_SPEECH_SILENCE_MIN_MS}, {END_OF_SPEECH_SILENCE_MAX_MS}]; "
+                f"clamped to {clamped}ms."
+            )
+        return clamped
+
     def build_join_payload(
         self,
         channel: str,
@@ -259,6 +304,20 @@ class ConvoAIClient:
                     "language": profile["asr_language"],
                     "vendor": asr_vendor,
                     "params": {},
+                },
+                # REQ-LAT-05. This is the first thing in the whole reply path: the Engine
+                # waits this long in silence before it even decides the learner has
+                # finished, so it is charged against the reply budget before any of this
+                # backend's streaming work begins.
+                "turn_detection": {
+                    "config": {
+                        "end_of_speech": {
+                            "mode": "vad",
+                            "vad_config": {
+                                "silence_duration_ms": self._resolve_end_of_speech_silence_ms(),
+                            },
+                        },
+                    },
                 },
                 "llm": {
                     "url": llm_url,

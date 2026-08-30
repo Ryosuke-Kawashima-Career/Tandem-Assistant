@@ -13,6 +13,7 @@ Key Test Classes:
 """
 
 import json
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -170,6 +171,63 @@ class TestConvoAIClient(unittest.TestCase):
         """Verify an unsupported language code degrades to the English profile."""
         payload = self.client.build_join_payload(channel="test-room", language="fr")
         self.assertEqual(payload["properties"]["asr"]["language"], "en-US")
+
+    def test_join_payload_configures_end_of_speech_detection(self):
+        """
+        Verify turn-end detection is configured rather than left at the vendor default
+        (REQ-LAT-05).
+
+        The Engine's default is 640ms of silence before it decides the learner has
+        stopped talking - spent before the LLM is called at all, so it comes straight
+        out of the sub-one-second budget no backend optimisation can recover.
+        """
+        payload = self.client.build_join_payload(channel="test-room", language="en")
+        vad_config = (
+            payload["properties"]["turn_detection"]["config"]["end_of_speech"]["vad_config"]
+        )
+
+        self.assertLess(vad_config["silence_duration_ms"], 640)
+        # Documented range is [120, 2000]; below it the request is rejected.
+        self.assertGreaterEqual(vad_config["silence_duration_ms"], 120)
+
+    def test_end_of_speech_silence_is_environment_configurable(self):
+        """
+        Verify the silence threshold is tunable without a code change (REQ-LAT-05).
+
+        Language learners hesitate mid-sentence far more than native speakers, so the
+        speed/clipping trade-off has to be tunable per deployment rather than frozen at
+        whatever value suits a demo.
+        """
+        import os
+        with patch.dict(os.environ, {"CONVOAI_END_OF_SPEECH_SILENCE_MS": "300"}):
+            payload = self.client.build_join_payload(channel="test-room", language="en")
+
+        vad_config = (
+            payload["properties"]["turn_detection"]["config"]["end_of_speech"]["vad_config"]
+        )
+        self.assertEqual(vad_config["silence_duration_ms"], 300)
+
+    def test_end_of_speech_silence_is_clamped_to_the_documented_range(self):
+        """
+        Verify an out-of-range value is clamped rather than sent to the API.
+
+        The documented range is [120, 2000]; a typo like 50 would otherwise fail the
+        whole /join call, taking down the conversation to save 70ms.
+        """
+        import os
+        with patch.dict(os.environ, {"CONVOAI_END_OF_SPEECH_SILENCE_MS": "10"}):
+            low = self.client.build_join_payload(channel="test-room", language="en")
+        with patch.dict(os.environ, {"CONVOAI_END_OF_SPEECH_SILENCE_MS": "99999"}):
+            high = self.client.build_join_payload(channel="test-room", language="en")
+
+        def silence(payload):
+            return (
+                payload["properties"]["turn_detection"]["config"]
+                ["end_of_speech"]["vad_config"]["silence_duration_ms"]
+            )
+
+        self.assertEqual(silence(low), 120)
+        self.assertEqual(silence(high), 2000)
 
     def test_agent_names_are_unique_per_session(self):
         """
@@ -333,6 +391,19 @@ class TestConvoAIEndpoints(unittest.TestCase):
         server_instance.convoai_session_context.clear()
         server_instance._convoai_last_channel = None
         server_instance.agent.reset_state()
+
+    def tearDown(self):
+        """
+        Drains any scaffolding future this test scheduled (REQ-LAT-02 test isolation).
+
+        Since scaffolding runs asynchronously on a shared executor, a test that posts to
+        /chat/completions without joining can leave a background task running past its
+        own return. Left undrained, that task can complete during a *later* test and
+        corrupt whichever mock happens to be active then - observed as
+        test_broadcast_still_runs_on_ambient_path's send_subtitle mock receiving two
+        different, genuinely LLM-generated replies from a test that made one direct call.
+        """
+        server_instance.wait_for_convoai_scaffolding(timeout=15)
 
     def test_module_singleton_never_hits_real_agora_api(self):
         """
@@ -513,6 +584,9 @@ class TestConvoAIEndpoints(unittest.TestCase):
         """
         Verify the bridge routes through TeachingAgent (REQ-11) rather than a separate
         reasoning path, by asserting the Japanese idiom scaffolding is produced.
+
+        Since REQ-LAT-02 the scaffolding call runs off the voice-critical path, so this
+        joins on it rather than assuming it completed before the response did.
         """
         with patch.object(
             server_instance.agent,
@@ -526,6 +600,7 @@ class TestConvoAIEndpoints(unittest.TestCase):
                     "messages": [{"role": "user", "content": "一期一会ですね！"}],
                 },
             )
+            server_instance.wait_for_convoai_scaffolding(timeout=10)
 
         spy.assert_called_once()
         self.assertEqual(spy.call_args[1]["text"], "一期一会ですね！")
@@ -554,6 +629,7 @@ class TestConvoAIEndpoints(unittest.TestCase):
                     "messages": [{"role": "user", "content": "Hello there"}],
                 },
             )
+            server_instance.wait_for_convoai_scaffolding(timeout=10)
 
         spy.assert_called_once()
         self.assertEqual(spy.call_args[1]["detected_language"], "ja")
@@ -578,6 +654,8 @@ class TestConvoAIEndpoints(unittest.TestCase):
                 },
             )
 
+            server_instance.wait_for_convoai_scaffolding(timeout=10)
+
         self.assertEqual(spy.call_args[1]["detected_language"], "hi")
 
     def test_session_speaker_id_reaches_the_agent(self):
@@ -593,6 +671,8 @@ class TestConvoAIEndpoints(unittest.TestCase):
                 "/chat/completions",
                 json={"messages": [{"role": "user", "content": "Good morning"}]},
             )
+
+            server_instance.wait_for_convoai_scaffolding(timeout=10)
 
         self.assertEqual(spy.call_args[1]["speaker_id"], "Kenji")
 
@@ -610,6 +690,7 @@ class TestConvoAIEndpoints(unittest.TestCase):
                 "/chat/completions",
                 json={"messages": [{"role": "user", "content": "Hello"}]},
             )
+            server_instance.wait_for_convoai_scaffolding(timeout=10)
 
         self.assertEqual(spy.call_args[1]["mode"], "tutor")
 
@@ -670,10 +751,14 @@ class TestConvoAIEndpoints(unittest.TestCase):
 
         Silence here is not neutral: the Convo AI Engine terminates an agent on
         idle_timeout (default 30s), so a hung model call ends the whole conversation.
+
+        Targets `stream_convoai_reply` rather than `process_convoai_turn`: since
+        REQ-LAT-02 the spoken reply comes from the streaming fast path, and a failure in
+        the (now asynchronous) scaffolding call no longer affects what is spoken.
         """
         with patch.object(
             server_instance,
-            "process_convoai_turn",
+            "stream_convoai_reply",
             side_effect=RuntimeError("provider exploded")
         ):
             response = self.app.post(
@@ -714,6 +799,345 @@ class TestConvoAIEndpoints(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn("data: [DONE]", response.get_data(as_text=True))
+
+
+class TestConvoAIObservability(unittest.TestCase):
+    """
+    Test suite for agent-side observability (REQ-LLM-09 / REQ-LLM-10).
+
+    Exists because a silent agent was indistinguishable from a healthy one in the
+    server log: agent errors reached the browser console only, so the operator
+    debugging from the terminal could not tell which module (asr / llm / tts) failed.
+    """
+
+    def setUp(self):
+        """Initialize the Flask test client."""
+        app.config["TESTING"] = True
+        self.app = app.test_client()
+
+    def test_agent_error_event_is_logged_server_side(self):
+        """
+        Verify a relayed AGENT_ERROR reaches the server log at ERROR level.
+
+        The failing module is the single most valuable field: it distinguishes a TTS
+        vendor rejection from an ASR failure from an LLM bridge problem, which is
+        otherwise only inferable by elimination.
+        """
+        with self.assertLogs("echosphere.server", level="ERROR") as captured:
+            res = self.app.post("/api/convoai/event", json={
+                "channel": "tokyo-mumbai-101",
+                "type": "agent_error",
+                "payload": {"module": "tts", "code": 1301, "message": "vendor rejected"},
+            })
+
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.get_json()["success"])
+        joined = " ".join(captured.output)
+        self.assertIn("tts", joined)
+        self.assertIn("vendor rejected", joined)
+
+    def test_agent_state_event_is_logged_server_side(self):
+        """Verify agent state transitions are visible in the terminal (REQ-LLM-09)."""
+        with self.assertLogs("echosphere.server", level="INFO") as captured:
+            res = self.app.post("/api/convoai/event", json={
+                "channel": "tokyo-mumbai-101",
+                "type": "agent_state",
+                "payload": {"state": "SPEAKING"},
+            })
+
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(any("SPEAKING" in line for line in captured.output))
+
+    def test_start_logs_the_agent_status_after_join(self):
+        """
+        Verify agent lifecycle status is polled and logged after /join (REQ-LLM-09).
+
+        query_agent() already existed and was already exposed at /api/convoai/status,
+        but nothing called it during a session, so a FAILED agent looked exactly like a
+        healthy one from the terminal.
+        """
+        with self.assertLogs("echosphere.server", level="INFO") as captured:
+            self.app.post("/api/convoai/start", json={"language": "en"})
+            server_instance.log_convoai_agent_health("tokyo-mumbai-101")
+
+        self.assertTrue(
+            any("agent health" in line.lower() for line in captured.output),
+            f"expected an agent health line, got: {captured.output}"
+        )
+
+    def test_agent_health_logging_survives_a_query_failure(self):
+        """
+        Verify a failing status query does not raise into the caller.
+
+        This runs alongside session start; an exception here would turn a diagnostic
+        into an outage.
+        """
+        with patch.object(
+            server_instance.convoai, "query_agent", side_effect=RuntimeError("api down")
+        ):
+            with self.assertLogs("echosphere.server", level="WARNING"):
+                server_instance.log_convoai_agent_health("tokyo-mumbai-101")
+
+    def test_event_endpoint_tolerates_a_malformed_body(self):
+        """
+        Verify a diagnostic endpoint never becomes a new failure source.
+
+        This is called from a client error handler; raising here would replace the
+        original problem with a confusing second one.
+        """
+        res = self.app.post("/api/convoai/event", json={})
+        self.assertEqual(res.status_code, 200)
+
+
+class TestConvoAILatency(unittest.TestCase):
+    """
+    Test suite for Convo AI reply latency
+    (dev/tasks/task_specs/latency_improvement.md).
+
+    Covers REQ-LAT-01 (per-turn timing logs), REQ-LAT-02 (the spoken reply is not gated
+    on scaffolding generation), and REQ-LAT-03 (provider deltas are forwarded as they
+    arrive rather than assembled and re-split).
+    """
+
+    def setUp(self):
+        """Initialize the Flask test client and clear any leftover session context."""
+        app.config["TESTING"] = True
+        self.app = app.test_client()
+        server_instance.agent.reset_state()
+
+    def tearDown(self):
+        """Drains any scaffolding future this test scheduled - see TestConvoAIEndpoints.tearDown."""
+        server_instance.wait_for_convoai_scaffolding(timeout=15)
+
+    @staticmethod
+    def _content_deltas(body: str) -> list:
+        """Reassembles the content deltas from a raw SSE body."""
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.strip().split("\n\n")
+            if line.startswith("data: ") and not line.endswith("[DONE]")
+        ]
+        return [
+            c["choices"][0]["delta"]["content"]
+            for c in chunks
+            if c["choices"][0]["delta"].get("content")
+        ]
+
+    # -- REQ-LAT-02: the voice reply is not blocked by scaffolding -------------------
+
+    def test_spoken_reply_is_not_blocked_by_slow_scaffolding(self):
+        """
+        Verify a slow structured-scaffolding call does not delay the spoken reply.
+
+        This is D-LAT-1: the bridge previously computed the whole JSON payload -
+        subtitles, idiom card, quiz, teacher alert - before emitting a single SSE chunk,
+        so the learner waited out the full generation in silence.
+        """
+        slow_scaffolding_seconds = 2.0
+
+        def slow_scaffolding(*args, **kwargs):
+            time.sleep(slow_scaffolding_seconds)
+            return {"spoken_response": "ignored"}
+
+        with patch.object(
+            server_instance, "process_convoai_turn", side_effect=slow_scaffolding
+        ):
+            started = time.time()
+            response = self.app.post(
+                "/chat/completions",
+                json={
+                    "language": "en",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+            body = response.get_data(as_text=True)
+            elapsed = time.time() - started
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+        self.assertTrue("".join(self._content_deltas(body)).strip())
+        self.assertLess(
+            elapsed, slow_scaffolding_seconds,
+            "the SSE reply must complete without waiting for scaffolding generation"
+        )
+
+    def test_scaffolding_still_reaches_the_data_stream(self):
+        """
+        Verify decoupling does not silently drop subtitles/idiom cards (criterion 6).
+
+        The scaffolding call moved off the voice-critical path; it must still run and
+        still broadcast, just without gating the spoken reply.
+        """
+        server_instance.rtc_client.is_connected = True
+        try:
+            with patch.object(server_instance.data_stream, "send_subtitle") as mock_sub:
+                self.app.post(
+                    "/chat/completions",
+                    json={
+                        "language": "ja",
+                        "messages": [{"role": "user", "content": "一期一会ですね！"}],
+                    },
+                )
+                server_instance.wait_for_convoai_scaffolding(timeout=10)
+            mock_sub.assert_called_once()
+        finally:
+            server_instance.rtc_client.is_connected = False
+
+    def test_scaffolding_failure_is_logged_and_does_not_break_the_reply(self):
+        """
+        Verify a failing background scaffolding task warns rather than vanishing.
+
+        A fire-and-forget future swallows exceptions by default, which would make a
+        broken scaffolding path invisible in the log.
+        """
+        with patch.object(
+            server_instance,
+            "process_convoai_turn",
+            side_effect=RuntimeError("scaffolding exploded")
+        ):
+            with self.assertLogs("echosphere.server", level="WARNING") as captured:
+                response = self.app.post(
+                    "/chat/completions",
+                    json={
+                        "language": "en",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                )
+                body = response.get_data(as_text=True)
+                server_instance.wait_for_convoai_scaffolding(timeout=10)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue("".join(self._content_deltas(body)).strip())
+        self.assertTrue(
+            any("scaffolding" in line.lower() for line in captured.output),
+            f"expected a scaffolding failure warning, got: {captured.output}"
+        )
+
+    def test_learner_turn_is_recorded_exactly_once(self):
+        """
+        Verify the utterance is not double-recorded now that two calls touch the agent.
+
+        The fast path records the turn; the scaffolding call must not record it again or
+        the model would see the learner say everything twice.
+        """
+        self.app.post("/api/convoai/start", json={"language": "en"})
+        self.app.post(
+            "/chat/completions",
+            json={"messages": [{"role": "user", "content": "Only once please"}]},
+        )
+        server_instance.wait_for_convoai_scaffolding(timeout=10)
+
+        matching = [
+            t for t in server_instance.agent.turn_history
+            if t["text"] == "Only once please"
+        ]
+        self.assertEqual(len(matching), 1)
+
+    # -- REQ-LAT-03: true token-level streaming ------------------------------------
+
+    def test_bridge_forwards_provider_deltas_as_they_arrive(self):
+        """
+        Verify provider deltas reach the wire one-for-one (REQ-LAT-03).
+
+        Previously the bridge assembled the whole reply and re-sliced it at fixed width,
+        so 'streaming' only paced delivery of an already-finished string.
+        """
+        provider_deltas = ["Konnichiwa", " Kenji", ", how are you?"]
+
+        with patch.object(
+            server_instance, "stream_convoai_reply", return_value=iter(provider_deltas)
+        ):
+            response = self.app.post(
+                "/chat/completions",
+                json={
+                    "language": "en",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                },
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertEqual(self._content_deltas(body), provider_deltas)
+
+    def test_bridge_preserves_the_sse_wire_contract_while_streaming(self):
+        """
+        Verify the Convo AI wire contract is unchanged by the streaming rewrite
+        (acceptance criterion 5): assistant role first, finish_reason stop, [DONE] last.
+        """
+        with patch.object(
+            server_instance, "stream_convoai_reply", return_value=iter(["a", "b", "c"])
+        ):
+            response = self.app.post(
+                "/chat/completions",
+                json={"messages": [{"role": "user", "content": "Hi"}]},
+            )
+            body = response.get_data(as_text=True)
+
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.strip().split("\n\n")
+            if line.startswith("data: ") and not line.endswith("[DONE]")
+        ]
+        self.assertEqual(chunks[0]["choices"][0]["delta"]["role"], "assistant")
+        self.assertEqual(chunks[0]["choices"][0]["delta"]["content"], "a")
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_bridge_falls_back_when_the_first_token_never_arrives(self):
+        """
+        Verify a stalled provider still produces speech (Task 3.5).
+
+        The timeout now bounds the wait for the *first* token rather than the whole
+        blocking call, since the reply is streamed.
+        """
+        def never_yields():
+            time.sleep(30)
+            yield "too late"
+
+        with patch.object(
+            server_instance, "stream_convoai_reply", return_value=never_yields()
+        ):
+            with patch("src.server.CONVOAI_LLM_TIMEOUT_SECONDS", 0.3):
+                response = self.app.post(
+                    "/chat/completions",
+                    json={
+                        "language": "en",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                    },
+                )
+                body = response.get_data(as_text=True)
+
+        self.assertEqual("".join(self._content_deltas(body)), FALLBACK_REPLIES["en"])
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    # -- REQ-LAT-01: latency instrumentation ---------------------------------------
+
+    def test_bridge_logs_time_to_first_chunk_and_total_duration(self):
+        """
+        Verify every turn reports its own latency (REQ-LAT-01).
+
+        Without this there is no baseline: 'it feels faster' is not a verification
+        strategy, and acceptance criterion 3 is measured from exactly this log line.
+        """
+        with self.assertLogs("echosphere.server", level="INFO") as captured:
+            response = self.app.post(
+                "/chat/completions",
+                json={
+                    "language": "en",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                },
+            )
+            # The timing line is emitted after the final SSE event, so the streamed body
+            # must be drained inside this block for the log to have been written.
+            response.get_data(as_text=True)
+
+        timing_lines = [
+            line for line in captured.output
+            if "first_chunk" in line and "total" in line
+        ]
+        self.assertTrue(
+            timing_lines,
+            f"expected a per-turn latency line, got: {captured.output}"
+        )
 
 
 if __name__ == '__main__':

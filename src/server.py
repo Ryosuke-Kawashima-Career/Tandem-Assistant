@@ -15,8 +15,10 @@ Key Classes and Objects:
 import os
 import json
 import time
+import queue
 import logging
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Optional, Dict, Any, Iterator, List
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_from_directory, Response, stream_with_context
@@ -36,7 +38,11 @@ load_dotenv(override=True)
 
 from src.rtc.agora_client import AgoraVoiceChannelClient, is_usable_credential
 from src.rtc.data_stream import DataStreamManager
-from src.rtc.convoai_client import ConvoAIClient
+from src.rtc.convoai_client import (
+    ConvoAIClient,
+    AGENT_STATUS_FAILED,
+    AGENT_STATUS_RECOVERING,
+)
 from src.agent.orchestrator import TeachingAgent
 from src.audio.vad_processor import VoiceActivityDetector
 from src.audio.stt_transcriber import STTTranscriber
@@ -55,6 +61,11 @@ CONVOAI_LLM_TIMEOUT_SECONDS = float(os.getenv("CONVOAI_LLM_TIMEOUT_SECONDS", "20
 # Size of each SSE content delta. The engine concatenates deltas, so this only controls
 # how early audio synthesis can begin, not the final text.
 SSE_CHUNK_CHARS = 24
+
+# Delay before the post-join agent health poll (REQ-LLM-09). Long enough for the Engine
+# to move the agent past STARTING, short enough to see a failure before the learner has
+# given up waiting for a voice.
+CONVOAI_HEALTH_POLL_DELAY_SECONDS = float(os.getenv("CONVOAI_HEALTH_POLL_DELAY_SECONDS", "5"))
 
 # Shared worker pool for Custom LLM turns. Module-level and never shut down: a
 # per-request executor would have to be joined, re-blocking on a hung provider call.
@@ -112,6 +123,10 @@ class EchoSphereServer:
         # only ever known here - captured when /api/convoai/start is called.
         self.convoai_session_context: Dict[str, Dict[str, Any]] = {}
         self._convoai_last_channel: Optional[str] = None
+
+        # Background scaffolding tasks (REQ-LAT-02). Retained only so tests and
+        # diagnostics can join on them; the request path never waits.
+        self._scaffolding_futures: List[Future] = []
 
         logger.info(
             f"EchoSphereServer initialized for channel '{channel_name}' "
@@ -313,7 +328,8 @@ class EchoSphereServer:
         self,
         speaker_id: str,
         text: str,
-        language: str = "en"
+        language: str = "en",
+        record_turn: bool = True
     ) -> Dict[str, Any]:
         """
         Processes one conversational turn arriving from the Convo AI Engine (REQ-11).
@@ -332,16 +348,132 @@ class EchoSphereServer:
         Runs in mode="tutor" (REQ-LLM-03): exactly one learner is in the channel, so the
         peer-mediation prompt - which instructs the model to balance two speakers - would
         make it address someone who is not there.
+
+        Since REQ-LAT-02 this generates scaffolding only - the spoken reply comes from
+        `stream_convoai_reply`, which already recorded the turn, hence record_turn=False
+        from the scheduled caller.
         """
         turn_result = self.agent.process_turn(
             speaker_id=speaker_id,
             text=text,
             detected_language=language,
-            mode="tutor"
+            mode="tutor",
+            record_turn=record_turn
         )
 
         self._broadcast_turn_payloads(turn_result, speaker_id, text)
         return turn_result
+
+    def log_convoai_agent_health(self, channel: str) -> Optional[Dict[str, Any]]:
+        """
+        Polls and logs the Convo AI agent's lifecycle status (REQ-LLM-09).
+
+        `query_agent()` and `/api/convoai/status` already existed, but nothing called
+        them during a session, so an agent in RECOVERING or FAILED was indistinguishable
+        in the terminal from a healthy one waiting for the learner to speak.
+
+        Never raises: this is diagnostic, and a status-query failure must not take down
+        the session start it runs alongside.
+        """
+        try:
+            agent = self.convoai.query_agent(channel=channel)
+        except Exception as exc:
+            logger.warning(
+                f"Could not query Convo AI agent health on channel '{channel}': {exc}"
+            )
+            return None
+
+        if not agent:
+            logger.warning(f"Convo AI agent health: no active agent on channel '{channel}'.")
+            return None
+
+        status = agent.get("status")
+        message = (
+            f"Convo AI agent health on channel '{channel}': status={status} "
+            f"(agent_id={agent.get('agent_id')}, simulated={agent.get('simulated')})."
+        )
+        if status in (AGENT_STATUS_FAILED, AGENT_STATUS_RECOVERING):
+            logger.error(f"{message} The agent is not healthy - it will not speak.")
+        else:
+            logger.info(message)
+        return agent
+
+    def stream_convoai_reply(
+        self,
+        speaker_id: str,
+        text: str,
+        language: str = "en"
+    ) -> Iterator[str]:
+        """
+        Streams the spoken reply for one Convo AI turn (REQ-LAT-02 / REQ-LAT-03).
+
+        This is the only work the learner waits on. The structured scaffolding that used
+        to be computed first - subtitles, idiom card, quiz, teacher alert - is scheduled
+        separately by `schedule_convoai_scaffolding` so it no longer sits between the
+        learner finishing a sentence and the agent starting to speak (D-LAT-1).
+
+        The learner's turn is recorded here, so the scaffolding call must run with
+        `record_turn=False` to avoid double-recording the same utterance.
+        """
+        return self.agent.generate_spoken_reply(
+            speaker_id=speaker_id,
+            text=text,
+            detected_language=language
+        )
+
+    def schedule_convoai_scaffolding(
+        self,
+        speaker_id: str,
+        text: str,
+        language: str = "en"
+    ) -> Future:
+        """
+        Runs the structured scaffolding generation off the voice-critical path (REQ-LAT-02).
+
+        Returns the Future so tests (and any future caller that needs to sequence on it)
+        can wait deterministically; nothing on the request path awaits it.
+
+        Failures are logged rather than swallowed: a bare fire-and-forget Future discards
+        its exception, which would make a permanently broken scaffolding path invisible
+        while the voice reply kept working.
+        """
+        def run_scaffolding() -> Dict[str, Any]:
+            return self.process_convoai_turn(
+                speaker_id=speaker_id,
+                text=text,
+                language=language,
+                record_turn=False
+            )
+
+        future = _TURN_EXECUTOR.submit(run_scaffolding)
+
+        def report_failure(completed: Future) -> None:
+            error = completed.exception()
+            if error is not None:
+                logger.warning(
+                    f"Convo AI scaffolding generation failed for '{speaker_id}': {error}. "
+                    f"The spoken reply was unaffected; subtitles and cards are missing "
+                    f"for this turn."
+                )
+
+        future.add_done_callback(report_failure)
+        self._scaffolding_futures.append(future)
+        return future
+
+    def wait_for_convoai_scaffolding(self, timeout: float = 10.0) -> None:
+        """
+        Blocks until scheduled scaffolding tasks finish. Test and diagnostic helper only -
+        the request path must never call this, since not waiting is the entire point.
+        """
+        pending = list(self._scaffolding_futures)
+        self._scaffolding_futures.clear()
+        for future in pending:
+            try:
+                future.result(timeout=timeout)
+            except Exception:
+                # Already reported by the done-callback; swallowed so one failing turn
+                # does not mask the remaining futures.
+                pass
 
 
 # ==============================================================================
@@ -488,6 +620,20 @@ def api_convoai_start():
         logger.error(f"Failed to start Convo AI agent on channel '{channel}': {exc}")
         return jsonify({"success": False, "error": str(exc)}), 502
 
+    # REQ-LLM-09: a 200 from /join means accepted, not healthy. Poll shortly after so a
+    # FAILED or RECOVERING agent is visible in the terminal rather than presenting as
+    # an agent that simply never speaks.
+    # Deliberately a timer thread, not _TURN_EXECUTOR: this task spends its whole life
+    # sleeping, and the turn executor is the pool the voice path depends on. Parking a
+    # sleeping worker there would starve exactly the requests this is meant to diagnose.
+    health_timer = threading.Timer(
+        CONVOAI_HEALTH_POLL_DELAY_SECONDS,
+        server_instance.log_convoai_agent_health,
+        args=(channel,)
+    )
+    health_timer.daemon = True
+    health_timer.start()
+
     return jsonify({"success": True, "agent": session.to_dict()}), 200
 
 
@@ -514,6 +660,46 @@ def api_convoai_stop():
     return jsonify({"success": success, "channel": channel}), status_code
 
 
+@app.route("/api/convoai/event", methods=["POST"])
+def api_convoai_event():
+    """
+    Receives agent-side lifecycle and error events relayed by the client (REQ-LLM-10).
+
+    The Convo AI Engine reports agent state and module failures over RTM, which only
+    the browser subscribes to. Without this relay an agent that joins and then fails
+    inside its ASR, LLM, or TTS module is indistinguishable in the server log from a
+    healthy one waiting for speech - the operator sees silence either way.
+
+    Deliberately forgiving: this is called from a client error handler, so a malformed
+    body must never raise. Losing a diagnostic is bad; replacing the original fault
+    with a second one is worse.
+    """
+    data = request.get_json(silent=True) or {}
+    channel = data.get("channel", "unknown")
+    event_type = str(data.get("type", "unknown"))
+    payload = data.get("payload")
+
+    if event_type == "agent_error":
+        details = payload if isinstance(payload, dict) else {"message": payload}
+        logger.error(
+            "Convo AI AGENT ERROR on channel '%s': module=%r code=%r message=%r. "
+            "The failing module names the layer to investigate: 'tts' points at the "
+            "voice vendor, 'asr' at transcription, 'llm' at the Custom LLM bridge.",
+            channel,
+            details.get("module"), details.get("code"), details.get("message"),
+        )
+    elif event_type == "agent_state":
+        state = payload.get("state") if isinstance(payload, dict) else payload
+        logger.info("Convo AI agent state on channel '%s': %s", channel, state)
+    else:
+        logger.info(
+            "Convo AI client event on channel '%s': type=%r payload=%r",
+            channel, event_type, payload
+        )
+
+    return jsonify({"success": True}), 200
+
+
 @app.route("/api/convoai/status", methods=["GET"])
 def api_convoai_status():
     """
@@ -532,11 +718,16 @@ def api_convoai_status():
 
 def _split_for_streaming(text: str, size: int = SSE_CHUNK_CHARS) -> List[str]:
     """
-    Splits reply text into incremental SSE deltas (Task 5.1).
+    Splits a already-complete reply into incremental SSE deltas.
 
     Fixed-width slices rather than word boundaries: Japanese and Hindi replies contain
     long runs with no spaces, and the Convo AI Engine concatenates deltas before
     synthesis, so the split point does not affect the spoken output.
+
+    Since REQ-LAT-03 this is only used for text that was never streamed in the first
+    place - the canned fallback line. A live provider reply is forwarded delta by delta
+    as the model produces it, which is the point: re-splitting a finished string paces
+    delivery but cannot make the first token arrive any sooner.
     """
     if not text:
         return []
@@ -609,7 +800,7 @@ def convoai_custom_llm_bridge():
         sorted(data.keys()), len(messages), speaker_id, language, language_source, user_text
     )
 
-    # Step 4: Stream the reply as SSE chunks, computing it inside the generator
+    # Step 4: Stream the reply as SSE chunks, forwarding provider deltas as they arrive
     def generate_sse() -> Iterator[str]:
         completion_id = f"chatcmpl-echosphere-{int(time.time() * 1000)}"
         created = int(time.time())
@@ -625,45 +816,80 @@ def convoai_custom_llm_bridge():
             return f"data: {json.dumps(body, ensure_ascii=False)}\n\n"
 
         started = time.time()
-        try:
-            # Bounded wait: a hung provider call must not leave the agent silent until
-            # the Convo AI Engine terminates the session on idle_timeout (Task 5.2).
-            # Runs on the shared pool rather than a per-request executor because a
-            # `with ThreadPoolExecutor(...)` block joins its worker on exit, which would
-            # re-block on exactly the hung call the timeout exists to abandon.
-            future = _TURN_EXECUTOR.submit(
-                server_instance.process_convoai_turn,
-                speaker_id=speaker_id,
-                text=user_text,
-                language=language
-            )
-            turn_result = future.result(timeout=CONVOAI_LLM_TIMEOUT_SECONDS)
-            reply_text = turn_result.get("spoken_response", "")
-        except FutureTimeoutError:
-            logger.warning(
-                f"Reasoning engine exceeded {CONVOAI_LLM_TIMEOUT_SECONDS}s on this turn; "
-                f"speaking the '{language}' fallback reply instead."
-            )
-            reply_text = ""
-        except Exception as exc:
-            logger.error(f"Convo AI turn failed: {exc}. Speaking the fallback reply.")
-            reply_text = ""
+        first_chunk_at: Optional[float] = None
 
-        if not reply_text:
-            reply_text = FALLBACK_REPLIES.get(language, FALLBACK_REPLIES["en"])
+        # A worker thread drains the provider stream into a queue while this generator
+        # forwards whatever has arrived. A queue rather than `future.result(timeout=...)`
+        # because the reply is now a stream: the bound that matters is the wait for the
+        # *next* delta, not for one finished blob (Task 3.5). A stall at any point -
+        # including before the first token - therefore falls back to speech instead of
+        # leaving the agent silent until the Engine's idle_timeout kills the session.
+        deltas: "queue.Queue[tuple]" = queue.Queue()
 
-        logger.debug(
-            "Convo AI reply ready in %.2fs (%d chars).", time.time() - started, len(reply_text)
+        def drain_provider_stream() -> None:
+            try:
+                for delta in server_instance.stream_convoai_reply(
+                    speaker_id=speaker_id, text=user_text, language=language
+                ):
+                    deltas.put(("delta", delta))
+            except Exception as exc:
+                deltas.put(("error", exc))
+            finally:
+                deltas.put(("done", None))
+
+        _TURN_EXECUTOR.submit(drain_provider_stream)
+
+        # Scaffolding runs in parallel with the spoken reply, never before it (REQ-LAT-02).
+        server_instance.schedule_convoai_scaffolding(
+            speaker_id=speaker_id, text=user_text, language=language
         )
 
-        # The first chunk carries the assistant role plus the first slice of content, so
-        # the engine can begin synthesis on the very first event.
-        pieces = _split_for_streaming(reply_text)
-        yield chunk({"role": "assistant", "content": pieces[0]}, None)
-        for piece in pieces[1:]:
-            yield chunk({"content": piece}, None)
+        emitted_any = False
+        while True:
+            try:
+                kind, payload = deltas.get(timeout=CONVOAI_LLM_TIMEOUT_SECONDS)
+            except queue.Empty:
+                logger.warning(
+                    f"Reasoning engine produced no output for "
+                    f"{CONVOAI_LLM_TIMEOUT_SECONDS}s; speaking the '{language}' fallback."
+                )
+                break
+
+            if kind == "error":
+                logger.error(f"Convo AI turn failed: {payload}. Speaking the fallback reply.")
+                break
+            if kind == "done":
+                break
+
+            if not payload:
+                continue
+
+            if not emitted_any:
+                emitted_any = True
+                first_chunk_at = time.time()
+                yield chunk({"role": "assistant", "content": payload}, None)
+            else:
+                yield chunk({"content": payload}, None)
+
+        if not emitted_any:
+            # Nothing was spoken: emit the canned line so the turn still produces audio.
+            fallback = FALLBACK_REPLIES.get(language, FALLBACK_REPLIES["en"])
+            pieces = _split_for_streaming(fallback)
+            first_chunk_at = time.time()
+            yield chunk({"role": "assistant", "content": pieces[0]}, None)
+            for piece in pieces[1:]:
+                yield chunk({"content": piece}, None)
+
         yield chunk({}, "stop")
         yield "data: [DONE]\n\n"
+
+        # REQ-LAT-01: the measurement acceptance criterion 3 is read from. Logged at INFO
+        # so a latency regression is visible without enabling debug logging.
+        time_to_first = (first_chunk_at - started) if first_chunk_at else float("nan")
+        logger.info(
+            "Convo AI turn latency: first_chunk=%.3fs, total=%.3fs (engine=%s, language=%s).",
+            time_to_first, time.time() - started, server_instance.agent.engine, language
+        )
 
     return Response(
         stream_with_context(generate_sse()),
