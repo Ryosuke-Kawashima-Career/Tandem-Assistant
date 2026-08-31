@@ -51,6 +51,17 @@ DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_OPENAI_SCAFFOLDING_MODEL = "gpt-5.4"
 DEFAULT_GEMINI_SCAFFOLDING_MODEL = "gemini-3.5-flash"
 
+# Human-readable names for the language codes the tutor path carries (REQ-LLM-02). The
+# Convo AI session language arrives as an ISO code, but the prompts name the language in
+# words, and the model has to be told which language the lesson is in: a live Phase 8.2
+# smoke on a "hi" session answered "Hindi isn't my specialty" because the prompt still
+# said "Target Language: Japanese", the agent's constructor default.
+LANGUAGE_NAMES: Dict[str, str] = {
+    "en": "English",
+    "ja": "Japanese",
+    "hi": "Hindi",
+}
+
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
@@ -216,6 +227,60 @@ class TeachingAgent:
         recent = self.turn_history[-max_turns:]
         return "\n".join(f"[{item['speaker']} ({item['lang']})]: {item['text']}" for item in recent)
 
+    def resolve_tutor_target_language(self, detected_language: str) -> str:
+        """
+        Resolves the language a 1:1 tutor turn should teach.
+
+        In the Convo AI path `detected_language` is the language the learner selected
+        when the session started (REQ-LLM-02), so it - not the constructor default -
+        decides the lesson. An unmapped code keeps the configured target rather than
+        inventing a language name for the model to act on.
+
+        Deliberately not applied to mediation: there `detected_language` reports which
+        language one utterance happened to be in, and a single code-switch must not
+        redirect the lesson.
+        """
+        return LANGUAGE_NAMES.get(
+            (detected_language or "").lower(), self.target_language
+        )
+
+    def build_tutor_prompt(
+        self,
+        speaker_id: str,
+        detected_language: str = "ja",
+        topic: Optional[str] = None
+    ) -> str:
+        """Builds the structured 1:1 scaffolding prompt for the session's language."""
+        return create_tutor_prompt(
+            recent_context=self.format_history_context(),
+            target_language=self.resolve_tutor_target_language(detected_language),
+            native_language=self.native_language,
+            learner_name=speaker_id,
+            topic=topic
+        )
+
+    def build_tutor_voice_prompt(
+        self,
+        speaker_id: str,
+        text: str,
+        detected_language: str = "ja",
+        topic: Optional[str] = None
+    ) -> str:
+        """
+        Builds the voice-critical 1:1 prompt for the session's language.
+
+        The recent context deliberately excludes `text` itself, which is passed
+        separately so the model sees clearly which utterance it is answering.
+        """
+        return create_tutor_voice_prompt(
+            recent_context=self.format_history_context(),
+            latest_utterance=text,
+            target_language=self.resolve_tutor_target_language(detected_language),
+            native_language=self.native_language,
+            learner_name=speaker_id,
+            topic=topic
+        )
+
     def process_turn(
         self,
         speaker_id: str,
@@ -260,11 +325,9 @@ class TeachingAgent:
 
         # Step 3: Build prompt for the requested mode
         if mode == "tutor":
-            prompt = create_tutor_prompt(
-                recent_context=context_str,
-                target_language=self.target_language,
-                native_language=self.native_language,
-                learner_name=speaker_id,
+            prompt = self.build_tutor_prompt(
+                speaker_id=speaker_id,
+                detected_language=detected_language,
                 topic=topic
             )
             system_prompt = SYSTEM_PROMPT_TANDEM_TUTOR
@@ -336,12 +399,10 @@ class TeachingAgent:
 
         # Step 2: Build the voice prompt from history *excluding* the utterance itself,
         # which is passed separately so the model sees clearly what to answer.
-        prompt = create_tutor_voice_prompt(
-            recent_context=self.format_history_context(),
-            latest_utterance=text,
-            target_language=self.target_language,
-            native_language=self.native_language,
-            learner_name=speaker_id,
+        prompt = self.build_tutor_voice_prompt(
+            speaker_id=speaker_id,
+            text=text,
+            detected_language=detected_language,
             topic=topic
         )
 

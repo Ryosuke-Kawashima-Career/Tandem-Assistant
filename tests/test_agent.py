@@ -605,5 +605,68 @@ class TestLatencyFastPath(unittest.TestCase):
         self.assertEqual(kwargs["model"], "gpt-test-tiny")
 
 
+class TestTutorSessionLanguage(unittest.TestCase):
+    """
+    Test suite for the language the 1:1 tutor path actually teaches.
+
+    A live Phase 8.2 smoke against real credentials showed a Hindi Convo AI session
+    answering "Hindi isn't my specialty" in English: the session language reached
+    `process_turn`/`generate_spoken_reply` as `detected_language`, but both prompts were
+    built from the constructor default `target_language` ("Japanese"), so the model was
+    told to teach a language the learner had not chosen. Only the tutor path is covered
+    here - in mediation mode `detected_language` is a per-utterance detection, not the
+    session's target language, and must not redirect the lesson.
+    """
+
+    def setUp(self):
+        """Initialize a mock-engine agent whose default target is deliberately wrong."""
+        self.agent = TeachingAgent(
+            engine="mock",
+            target_language="Japanese",
+            native_language="English"
+        )
+
+    def test_tutor_prompt_follows_the_session_language(self):
+        """Verify a Hindi tutor turn asks the model to teach Hindi, not Japanese."""
+        prompt = self.agent.build_tutor_prompt(
+            speaker_id="Kenji", detected_language="hi"
+        )
+
+        self.assertIn("Target Language: Hindi", prompt)
+        self.assertNotIn("Target Language: Japanese", prompt)
+
+    def test_voice_prompt_follows_the_session_language(self):
+        """Verify the voice-critical path carries the same language as the session."""
+        prompt = self.agent.build_tutor_voice_prompt(
+            speaker_id="Kenji", text="नमस्ते", detected_language="hi"
+        )
+
+        self.assertIn("Target Language: Hindi", prompt)
+        self.assertNotIn("Target Language: Japanese", prompt)
+
+    def test_unknown_language_code_keeps_the_configured_target(self):
+        """Verify an unmapped code falls back rather than naming a bogus language."""
+        prompt = self.agent.build_tutor_prompt(
+            speaker_id="Kenji", detected_language="zz"
+        )
+
+        self.assertIn("Target Language: Japanese", prompt)
+
+    def test_mediation_prompt_ignores_the_detected_language(self):
+        """
+        Verify ambient mediation still teaches the configured target language: there,
+        `detected_language` reports which language an utterance happened to be in.
+        """
+        with patch("src.agent.orchestrator.create_teaching_prompt") as create_prompt:
+            create_prompt.return_value = "prompt"
+            self.agent.process_turn(
+                speaker_id="Kenji", text="Namaste", detected_language="hi"
+            )
+
+        self.assertEqual(
+            create_prompt.call_args[1]["target_language"], "Japanese"
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
