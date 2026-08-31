@@ -23,8 +23,8 @@ class TestEchoSphereServer(unittest.TestCase):
         self.assertEqual(data["service"], "EchoSphere Tandem Co-Teacher")
 
     def test_session_lifecycle_and_turn_processing(self):
-        # 1. Start session
-        start_res = self.app.post("/api/session/start")
+        # 1. Start session. REQ-12: creation requires an explicit, immutable mode.
+        start_res = self.app.post("/api/session/start", json={"mode": "language_learning"})
         self.assertEqual(start_res.status_code, 200)
         self.assertTrue(start_res.get_json()["success"])
 

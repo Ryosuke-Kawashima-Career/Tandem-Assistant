@@ -420,7 +420,7 @@ class TestConvoAIEndpoints(unittest.TestCase):
         """
         Verify the /api/convoai/start and /api/convoai/stop lifecycle endpoints.
         """
-        start_res = self.app.post("/api/convoai/start", json={"language": "ja"})
+        start_res = self.app.post("/api/convoai/start", json={"language": "ja", "mode": "language_learning"})
         self.assertEqual(start_res.status_code, 200)
         start_data = start_res.get_json()
         self.assertTrue(start_data["success"])
@@ -435,7 +435,7 @@ class TestConvoAIEndpoints(unittest.TestCase):
         """
         Verify /api/convoai/status reports the active agent for a channel.
         """
-        self.app.post("/api/convoai/start", json={"language": "hi"})
+        self.app.post("/api/convoai/start", json={"language": "hi", "mode": "language_learning"})
         status_res = self.app.get("/api/convoai/status")
 
         self.assertEqual(status_res.status_code, 200)
@@ -614,7 +614,7 @@ class TestConvoAIEndpoints(unittest.TestCase):
         so a bridge reading data.get("language", "en") always resolved to English - the
         learner's choice never reached the model. The session context must supply it.
         """
-        self.app.post("/api/convoai/start", json={"language": "ja"})
+        self.app.post("/api/convoai/start", json={"language": "ja", "mode": "language_learning"})
 
         with patch.object(
             server_instance.agent,
@@ -639,7 +639,7 @@ class TestConvoAIEndpoints(unittest.TestCase):
         Verify an explicit request field still wins, so direct/manual calls can drive the
         bridge without a live Convo AI session.
         """
-        self.app.post("/api/convoai/start", json={"language": "ja"})
+        self.app.post("/api/convoai/start", json={"language": "ja", "mode": "language_learning"})
 
         with patch.object(
             server_instance.agent,
@@ -660,7 +660,7 @@ class TestConvoAIEndpoints(unittest.TestCase):
 
     def test_session_speaker_id_reaches_the_agent(self):
         """Verify speaker_id resolves from session context too, not a permanent default."""
-        self.app.post("/api/convoai/start", json={"language": "en", "speaker_id": "Kenji"})
+        self.app.post("/api/convoai/start", json={"language": "en", "speaker_id": "Kenji", "mode": "language_learning"})
 
         with patch.object(
             server_instance.agent,
@@ -702,7 +702,7 @@ class TestConvoAIEndpoints(unittest.TestCase):
         previously accumulated across every session and channel, so a second learner
         inherited the first learner's dialogue as model context.
         """
-        self.app.post("/api/convoai/start", json={"language": "ja"})
+        self.app.post("/api/convoai/start", json={"language": "ja", "mode": "language_learning"})
         self.app.post(
             "/chat/completions",
             json={"messages": [{"role": "user", "content": "一期一会ですね！"}]},
@@ -710,7 +710,7 @@ class TestConvoAIEndpoints(unittest.TestCase):
         self.assertGreater(len(server_instance.agent.turn_history), 0)
 
         self.app.post("/api/convoai/stop", json={})
-        self.app.post("/api/convoai/start", json={"language": "ja"})
+        self.app.post("/api/convoai/start", json={"language": "ja", "mode": "language_learning"})
 
         self.assertEqual(server_instance.agent.turn_history, [])
         self.assertEqual(server_instance.agent.speaker_durations_ms, {})
@@ -857,7 +857,7 @@ class TestConvoAIObservability(unittest.TestCase):
         healthy one from the terminal.
         """
         with self.assertLogs("echosphere.server", level="INFO") as captured:
-            self.app.post("/api/convoai/start", json={"language": "en"})
+            self.app.post("/api/convoai/start", json={"language": "en", "mode": "language_learning"})
             server_instance.log_convoai_agent_health("tokyo-mumbai-101")
 
         self.assertTrue(
@@ -1020,7 +1020,7 @@ class TestConvoAILatency(unittest.TestCase):
         The fast path records the turn; the scaffolding call must not record it again or
         the model would see the learner say everything twice.
         """
-        self.app.post("/api/convoai/start", json={"language": "en"})
+        self.app.post("/api/convoai/start", json={"language": "en", "mode": "language_learning"})
         self.app.post(
             "/chat/completions",
             json={"messages": [{"role": "user", "content": "Only once please"}]},

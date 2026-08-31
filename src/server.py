@@ -38,6 +38,10 @@ load_dotenv(override=True)
 
 from src.rtc.agora_client import AgoraVoiceChannelClient, is_usable_credential
 from src.rtc.data_stream import DataStreamManager
+from src.artifacts.generator import ArtifactGenerator
+from src.artifacts.models import stable_entity_id
+from src.sessions.models import InvalidSessionModeError, SessionMode
+from src.sessions.service import SessionService
 from src.rtc.convoai_client import (
     ConvoAIClient,
     AGENT_STATUS_FAILED,
@@ -115,6 +119,16 @@ class EchoSphereServer:
         # Step 4: Convo AI direct audio conversation engine (REQ-09 / REQ-10)
         self.convoai = ConvoAIClient()
 
+        # Session modes (REQ-12). One registry owns the mode for every channel, so
+        # prompts, RTC events, quizzes, and notes all branch on the same answer.
+        self.sessions = SessionService()
+
+        # Session artifacts (REQ-13 / REQ-14). Generation is driven from the finalized
+        # turn, off the voice-critical path, and publishes quiz.created / note.upserted
+        # over the same RTC data stream the scaffolding widgets already use.
+        self.artifact_generator = ArtifactGenerator(data_stream=self.data_stream)
+        self.artifacts = self.artifact_generator.repository
+
         self.is_active = False
 
         # Step 5: Per-channel Convo AI session context (REQ-LLM-02).
@@ -137,7 +151,8 @@ class EchoSphereServer:
         self,
         channel: str,
         language: str = "en",
-        speaker_id: str = "Learner"
+        speaker_id: str = "Learner",
+        mode: Any = None
     ) -> Dict[str, Any]:
         """
         Records the session context for a starting Convo AI conversation (REQ-LLM-02).
@@ -146,10 +161,18 @@ class EchoSphereServer:
         turn_history and speaker_durations_ms otherwise persist for the lifetime of the
         process, so a new learner would inherit the previous one's dialogue as context.
         """
+        session = self.sessions.create_session(
+            channel=channel,
+            mode=mode,
+            languages=[language],
+            participants=[speaker_id]
+        )
         context = {
             "channel": channel,
             "language": language,
             "speaker_id": speaker_id,
+            "mode": session.mode.value,
+            "session_id": session.session_id,
             "started_at": int(time.time()),
         }
         self.convoai_session_context[channel] = context
@@ -157,7 +180,7 @@ class EchoSphereServer:
         self.agent.reset_state()
         logger.info(
             f"Convo AI session context registered for channel '{channel}' "
-            f"(language: {language}, speaker: {speaker_id})."
+            f"(language: {language}, speaker: {speaker_id}, mode: {session.mode.value})."
         )
         return context
 
@@ -166,6 +189,7 @@ class EchoSphereServer:
         Drops the session context for a channel and resets conversation state (REQ-LLM-05).
         """
         self.convoai_session_context.pop(channel, None)
+        self.sessions.end_session(channel)
         if self._convoai_last_channel == channel:
             self._convoai_last_channel = None
         self.agent.reset_state()
@@ -186,6 +210,23 @@ class EchoSphereServer:
         if self._convoai_last_channel:
             return self.convoai_session_context.get(self._convoai_last_channel, {})
         return {}
+
+    def session_mode_for(self, channel: Optional[str] = None) -> SessionMode:
+        """
+        Resolves the session mode that a turn on this channel belongs to (REQ-12).
+
+        Falls back to the Convo AI session context - and finally to language learning -
+        because the Custom LLM bridge is called without a channel, so a turn can arrive
+        before the caller has told us which channel it is on. The creation endpoints
+        reject a missing mode, so this fallback covers resolution, never validation.
+        """
+        mode = self.sessions.mode_for(channel) if channel else None
+        if mode is not None:
+            return mode
+
+        context = self.resolve_convoai_context(channel)
+        resolved = self.sessions.mode_for(context.get("channel")) if context else None
+        return resolved or SessionMode.LANGUAGE_LEARNING
 
     def start_session(self) -> bool:
         """
@@ -221,7 +262,8 @@ class EchoSphereServer:
         self,
         speaker_id: str,
         text_or_audio: Any,
-        language: str = "en"
+        language: str = "en",
+        channel: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Processes a single conversational turn from a student learner.
@@ -229,7 +271,8 @@ class EchoSphereServer:
         Algorithm:
         1. If input is raw PCM audio bytes, transcribe speech via STTTranscriber.
         2. Forward transcription to TeachingAgent for mediation, transliteration, and cultural idiom analysis.
-        3. Broadcast live subtitles and detected idiom cards over Agora RTC Data Stream.
+        3. Broadcast live subtitles and detected idiom cards over Agora RTC Data Stream,
+           and file the notes and quiz this turn produced (REQ-13 / REQ-14).
         4. Synthesize AI voice response via TTSSynthesizer and publish to RTC channel if needed.
         5. Return full structured turn payload.
         """
@@ -242,15 +285,20 @@ class EchoSphereServer:
             spoken_text = str(text_or_audio)
             detected_lang = language
 
-        # Step 2: AI Agent Mediation
+        # Step 2: AI Agent Mediation, under this channel's session mode (REQ-12)
         turn_result = self.agent.process_turn(
             speaker_id=speaker_id,
             text=spoken_text,
-            detected_language=detected_lang
+            detected_language=detected_lang,
+            session_mode=self.session_mode_for(channel or self.channel_name)
         )
 
-        # Step 3: Broadcast over RTC Data Stream
+        # Step 3: Broadcast over RTC Data Stream, then file the turn's artifacts
+        # (REQ-13 / REQ-14) - an ambient peer turn is as finalized as a Convo AI one.
         self._broadcast_turn_payloads(turn_result, speaker_id, spoken_text)
+        self.generate_turn_artifacts(
+            turn_result, speaker_id, spoken_text, channel or self.channel_name
+        )
 
         # Step 4: AI Speech Synthesis & RTC Audio Track
         spoken_response = turn_result.get("spoken_response", "")
@@ -329,7 +377,8 @@ class EchoSphereServer:
         speaker_id: str,
         text: str,
         language: str = "en",
-        record_turn: bool = True
+        record_turn: bool = True,
+        channel: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Processes one conversational turn arriving from the Convo AI Engine (REQ-11).
@@ -353,16 +402,60 @@ class EchoSphereServer:
         `stream_convoai_reply`, which already recorded the turn, hence record_turn=False
         from the scheduled caller.
         """
+        session_mode = self.session_mode_for(channel)
         turn_result = self.agent.process_turn(
             speaker_id=speaker_id,
             text=text,
             detected_language=language,
             mode="tutor",
-            record_turn=record_turn
+            record_turn=record_turn,
+            session_mode=session_mode
         )
 
         self._broadcast_turn_payloads(turn_result, speaker_id, text)
+        self.generate_turn_artifacts(turn_result, speaker_id, text, channel)
         return turn_result
+
+    def generate_turn_artifacts(
+        self,
+        turn_result: Dict[str, Any],
+        speaker_id: str,
+        text: str,
+        channel: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Files the quizzes and notes a finalized turn produced (REQ-13 / REQ-14).
+
+        Algorithm:
+        1. Resolve the session this turn belongs to; without one there is no mode, and
+           artifacts generated under a guessed mode are worse than none.
+        2. Derive the turn's stable id so every artifact is source-linked to it.
+        3. Generate notes and (mode permitting) a quiz, which stores and announces them.
+
+        Runs on whichever thread called it - in the Convo AI path that is the background
+        scaffolding executor, already off the voice-critical path (REQ-LAT-02). Failures
+        are swallowed with a warning for the same reason the scaffolding call is: losing
+        a note must not take down the conversation that produced it.
+        """
+        resolved_channel = channel or self.resolve_convoai_context(channel).get("channel")
+        session = self.sessions.get_session(resolved_channel) if resolved_channel else None
+        if session is None:
+            return {"notes": [], "quiz": None}
+
+        turn_id = stable_entity_id("turn", session.session_id, speaker_id, text)
+
+        try:
+            notes = self.artifact_generator.generate_notes(turn_result, session, [turn_id])
+            quiz = self.artifact_generator.generate_quiz(turn_result, session, [turn_id])
+        except Exception as exc:
+            logger.warning(
+                "Artifact generation failed for session %s: %s. The conversation is "
+                "unaffected; this turn produced no notes or quiz.",
+                session.session_id, exc
+            )
+            return {"notes": [], "quiz": None}
+
+        return {"notes": notes, "quiz": quiz}
 
     def log_convoai_agent_health(self, channel: str) -> Optional[Dict[str, Any]]:
         """
@@ -402,7 +495,8 @@ class EchoSphereServer:
         self,
         speaker_id: str,
         text: str,
-        language: str = "en"
+        language: str = "en",
+        channel: Optional[str] = None
     ) -> Iterator[str]:
         """
         Streams the spoken reply for one Convo AI turn (REQ-LAT-02 / REQ-LAT-03).
@@ -418,14 +512,16 @@ class EchoSphereServer:
         return self.agent.generate_spoken_reply(
             speaker_id=speaker_id,
             text=text,
-            detected_language=language
+            detected_language=language,
+            session_mode=self.session_mode_for(channel)
         )
 
     def schedule_convoai_scaffolding(
         self,
         speaker_id: str,
         text: str,
-        language: str = "en"
+        language: str = "en",
+        channel: Optional[str] = None
     ) -> Future:
         """
         Runs the structured scaffolding generation off the voice-critical path (REQ-LAT-02).
@@ -442,7 +538,8 @@ class EchoSphereServer:
                 speaker_id=speaker_id,
                 text=text,
                 language=language,
-                record_turn=False
+                record_turn=False,
+                channel=channel
             )
 
         future = _TURN_EXECUTOR.submit(run_scaffolding)
@@ -512,19 +609,78 @@ def health_check():
 @app.route("/api/session/start", methods=["POST"])
 def api_start_session():
     """
-    Starts the Agora RTC and AI co-teacher session.
+    Starts the Agora RTC session under an explicit, immutable mode (REQ-12).
+
+    `mode` is required: every downstream artifact - prompt selection, quizzes, notes -
+    is mode-shaped, so a defaulted mode produces a session whose output silently does not
+    match what the user asked for. Invalid or missing => 400.
     """
+    data = request.get_json(silent=True) or {}
+    channel = data.get("channel", server_instance.channel_name)
+
+    try:
+        session = server_instance.sessions.create_session(
+            channel=channel,
+            mode=data.get("mode"),
+            languages=data.get("languages") or [],
+            participants=data.get("participants") or []
+        )
+    except InvalidSessionModeError as exc:
+        return jsonify({
+            "success": False,
+            "error": str(exc),
+            "supported_modes": SessionMode.values()
+        }), 400
+
     success = server_instance.start_session()
-    return jsonify({"success": success, "channel": server_instance.channel_name}), 200
+    return jsonify({
+        "success": success,
+        "channel": channel,
+        "mode": session.mode.value,
+        "session_id": session.session_id
+    }), 200
 
 
 @app.route("/api/session/stop", methods=["POST"])
 def api_stop_session():
     """
-    Stops the active session.
+    Stops the active session and closes its mode registration (REQ-12).
     """
+    data = request.get_json(silent=True) or {}
+    channel = data.get("channel", server_instance.channel_name)
+
+    closed = server_instance.sessions.end_session(channel)
     success = server_instance.stop_session()
-    return jsonify({"success": success}), 200
+    return jsonify({
+        "success": success,
+        "channel": channel,
+        "session_id": closed.session_id if closed else None
+    }), 200
+
+
+@app.route("/api/session/status", methods=["GET"])
+def api_session_status():
+    """
+    Reports the mode and identity of the session on a channel (REQ-12).
+
+    Exists so a reconnecting client can recover the mode it must keep sending without
+    re-creating the session - and so an operator can see which contract a channel is
+    running under without reading the creation response back out of a log.
+    """
+    channel = request.args.get("channel", server_instance.channel_name)
+    session = server_instance.sessions.get_session(channel)
+
+    if session is None:
+        return jsonify({
+            "success": False,
+            "channel": channel,
+            "mode": None,
+            "error": f"No active session on channel '{channel}'."
+        }), 404
+
+    body = session.to_dict()
+    body["success"] = True
+    return jsonify(body), 200
 
 
 @app.route("/api/session/turn", methods=["POST"])
@@ -537,7 +693,12 @@ def api_process_turn():
     text = data.get("text", "")
     language = data.get("language", "en")
 
-    result = server_instance.process_turn(speaker_id=speaker_id, text_or_audio=text, language=language)
+    result = server_instance.process_turn(
+        speaker_id=speaker_id,
+        text_or_audio=text,
+        language=language,
+        channel=data.get("channel")
+    )
     return jsonify({"success": True, "result": result}), 200
 
 
@@ -603,11 +764,21 @@ def api_convoai_start():
     # REQ-LLM-02 / REQ-LLM-05: this is the only point at which the learner's chosen
     # language is known, so capture it here for the Custom LLM bridge to read back, and
     # start the conversation from clean agent state.
-    server_instance.register_convoai_session(
-        channel=channel,
-        language=language,
-        speaker_id=data.get("speaker_id", "Learner")
-    )
+    # REQ-12: the mode is required here too, and creating the session is what registers
+    # it. An unusable mode must fail before an agent is started, not after.
+    try:
+        server_instance.register_convoai_session(
+            channel=channel,
+            language=language,
+            speaker_id=data.get("speaker_id", "Learner"),
+            mode=data.get("mode")
+        )
+    except InvalidSessionModeError as exc:
+        return jsonify({
+            "success": False,
+            "error": str(exc),
+            "supported_modes": SessionMode.values()
+        }), 400
 
     try:
         session = server_instance.convoai.start_agent(
@@ -713,6 +884,70 @@ def api_convoai_status():
         "success": agent is not None,
         "agent": agent,
         "active_sessions": server_instance.convoai.list_sessions()
+    }), 200
+
+
+@app.route("/api/session/notes", methods=["GET"])
+def api_session_notes():
+    """
+    Returns the notes captured for the session on a channel (REQ-14).
+    """
+    channel = request.args.get("channel", server_instance.channel_name)
+    session = server_instance.sessions.get_session(channel)
+    if session is None:
+        return jsonify({"success": False, "channel": channel, "notes": [],
+                        "error": f"No active session on channel '{channel}'."}), 404
+
+    notes = server_instance.artifacts.list_notes(session.session_id)
+    return jsonify({
+        "success": True,
+        "channel": channel,
+        "session_id": session.session_id,
+        "mode": session.mode.value,
+        "notes": [note.to_dict() for note in notes]
+    }), 200
+
+
+@app.route("/api/session/notes/<note_id>", methods=["DELETE"])
+def api_delete_session_note(note_id: str):
+    """
+    Deletes one note and announces it over RTC (REQ-14).
+
+    A missing note is a 404 rather than a success: a stale client deleting twice must not
+    produce a second `note.deleted` event for a note nobody else still shows.
+    """
+    channel = request.args.get("channel", server_instance.channel_name)
+    session = server_instance.sessions.get_session(channel)
+    if session is None:
+        return jsonify({"success": False, "channel": channel,
+                        "error": f"No active session on channel '{channel}'."}), 404
+
+    deleted = server_instance.artifact_generator.delete_note(note_id, session)
+    if deleted is None:
+        return jsonify({"success": False, "note_id": note_id,
+                        "error": "No such note."}), 404
+
+    return jsonify({"success": True, "note": deleted.to_dict()}), 200
+
+
+@app.route("/api/session/quizzes", methods=["GET"])
+def api_session_quizzes():
+    """
+    Returns the quizzes generated for the session on a channel (REQ-13).
+    """
+    channel = request.args.get("channel", server_instance.channel_name)
+    session = server_instance.sessions.get_session(channel)
+    if session is None:
+        return jsonify({"success": False, "channel": channel, "quizzes": [],
+                        "error": f"No active session on channel '{channel}'."}), 404
+
+    quizzes = server_instance.artifacts.list_quizzes(session.session_id)
+    return jsonify({
+        "success": True,
+        "channel": channel,
+        "session_id": session.session_id,
+        "mode": session.mode.value,
+        "quizzes": [quiz.to_dict() for quiz in quizzes]
     }), 200
 
 
@@ -829,7 +1064,8 @@ def convoai_custom_llm_bridge():
         def drain_provider_stream() -> None:
             try:
                 for delta in server_instance.stream_convoai_reply(
-                    speaker_id=speaker_id, text=user_text, language=language
+                    speaker_id=speaker_id, text=user_text, language=language,
+                    channel=session_context.get("channel")
                 ):
                     deltas.put(("delta", delta))
             except Exception as exc:
@@ -841,7 +1077,8 @@ def convoai_custom_llm_bridge():
 
         # Scaffolding runs in parallel with the spoken reply, never before it (REQ-LAT-02).
         server_instance.schedule_convoai_scaffolding(
-            speaker_id=speaker_id, text=user_text, language=language
+            speaker_id=speaker_id, text=user_text, language=language,
+            channel=session_context.get("channel")
         )
 
         emitted_any = False

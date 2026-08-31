@@ -19,9 +19,11 @@
       </div>
 
       <div class="macos-header-status">
-        <div class="macos-segmented-control" id="role-switcher">
-          <button class="macos-segmented-btn active" data-role="student">👩‍🎓 Student View</button>
-          <button class="macos-segmented-btn" data-role="teacher">👨‍🏫 Teacher Oversight</button>
+        <!-- Session mode (REQ-12). Immutable once a session starts, so the backend
+             rejects a mid-session switch and these buttons disable while one is live. -->
+        <div class="macos-segmented-control" id="mode-switcher" title="Session mode - fixed once the session starts">
+          <button class="macos-segmented-btn active" data-mode="language_learning">🎓 Language Learning</button>
+          <button class="macos-segmented-btn" data-mode="international_work">🌏 International Work</button>
         </div>
         <div style="display: flex; align-items: center; gap: 6px;">
           <span class="status-dot" id="connection-dot"></span>
@@ -160,7 +162,7 @@
       <!-- Right Column: AI Co-Teacher Scaffolding -->
       <section class="macos-card-panel" id="panel-scaffolding">
         <div class="macos-panel-header">
-          <span class="macos-panel-title">✨ AI Pedagogical Insights</span>
+          <span class="macos-panel-title" id="scaffolding-title">✨ AI Pedagogical Insights</span>
           <span class="macos-badge-pill" style="background: rgba(52, 199, 89, 0.1); color: var(--macos-accent-green); border-color: rgba(52, 199, 89, 0.2);">Live Assist</span>
         </div>
         <div class="macos-panel-content" id="scaffolding-container">
@@ -173,10 +175,23 @@
             <div class="idiom-cultural-note">💡 A four-character idiom (Yojijukugo) rooted in Japanese tea ceremony philosophy reminding participants to cherish every conversation.</div>
           </div>
         </div>
+
+        <!-- Session notes (REQ-14). Populated by note.upserted / note.deleted events;
+             the note vocabulary rendered here follows the session mode. -->
+        <div class="macos-panel-header" style="margin-top: 12px;">
+          <span class="macos-panel-title" id="notes-title">📝 Session Notes</span>
+          <span class="macos-badge-pill" id="notes-count">0</span>
+        </div>
+        <div class="macos-panel-content" id="notes-container">
+          <div class="notes-empty" id="notes-empty-hint">
+            Notes captured from the conversation appear here. Anything the assistant only
+            inferred is held for your confirmation before it counts.
+          </div>
+        </div>
       </section>
     </main>
 
-    <!-- 4. Teacher Oversight Floating Dock (Controlled via Segmented Switcher) -->
+    <!-- 4. Teacher Oversight Floating Dock (language_learning mode only) -->
     <footer class="teacher-dock hidden" id="teacher-oversight-dock">
       <div class="teacher-alert-banner">
         <span class="teacher-alert-pill warning" id="teacher-alert-pill">ALERT</span>

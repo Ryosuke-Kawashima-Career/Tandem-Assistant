@@ -54,13 +54,16 @@ export class ConvoAIService {
    * before treating the AI as live.
    *
    * @param {string} language - Target language: 'hi', 'ja', or 'en'
+   * @param {string} mode - Session mode: 'language_learning' or 'international_work'.
+   *   Required by the backend (REQ-12); a missing or unknown value is a 400, never a
+   *   silent default, because every artifact the session produces is mode-shaped.
    * @returns {Promise<Object>} Agent descriptor including agent_id and status
    */
-  async startAgent(language = 'en') {
+  async startAgent(language = 'en', mode = 'language_learning') {
     const res = await fetch('/api/convoai/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: this.channelName, language })
+      body: JSON.stringify({ channel: this.channelName, language, mode })
     });
 
     const data = await res.json();

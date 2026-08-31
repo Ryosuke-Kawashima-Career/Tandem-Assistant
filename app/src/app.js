@@ -5,7 +5,7 @@
  *     1. Agora RTC Web SDK connection (microphone capture, SD-RTN voice channel join/leave).
  *     2. Agora RTC Data Stream listener via AgoraStreamManager.
  *     3. UI Components: Subtitles, IdiomCard, TopicWidget, TeacherBar, QuizWidget.
- *     4. Role switcher (Student View vs Teacher Oversight Dashboard).
+ *     4. Session mode switcher (Language Learning vs International Work - REQ-12).
  *     5. Direct spoken conversation with the Convo AI co-teacher (REQ-09).
  *     6. Interactive multi-turn demo simulation covering Japanese, Hindi, and English exchange.
  *
@@ -22,13 +22,14 @@ import { IdiomCard } from './components/IdiomCard.js';
 import { TopicWidget } from './components/TopicWidget.js';
 import { TeacherBar } from './components/TeacherBar.js';
 import { QuizWidget } from './components/QuizWidget.js';
+import { NotesPanel } from './components/NotesPanel.js';
 
 class TandemApp {
   /**
    * Initialize Tandem Application.
    * 
    * Algorithm:
-   * 1. Initialize client state (channel, role, joined status, mic status).
+   * 1. Initialize client state (channel, session mode, joined status, mic status).
    * 2. Instantiate UI component controllers.
    * 3. Attach AgoraStreamManager and wire stream event listeners.
    * 4. Bind DOM UI event listeners.
@@ -37,7 +38,9 @@ class TandemApp {
     // Step 1: Client State
     this.appId = 'mock_agora_app_id';
     this.channelName = 'tokyo-mumbai-101';
-    this.currentRole = 'student';
+    // Session mode (REQ-12). Immutable once a session starts: the backend refuses a
+    // mid-session change, so the switcher locks itself while a conversation is live.
+    this.currentMode = 'language_learning';
     this.isJoined = false;
     this.isMuted = false;
     this.localAudioTrack = null;
@@ -63,6 +66,10 @@ class TandemApp {
     this.subtitles = new Subtitles('#subtitles-container');
     this.idiomCard = new IdiomCard('#scaffolding-container');
     this.quizWidget = new QuizWidget('#scaffolding-container');
+    this.notesPanel = new NotesPanel('#notes-container', {
+      emptyHint: '#notes-empty-hint',
+      countBadge: '#notes-count'
+    });
     this.topicWidget = new TopicWidget({
       topicTitle: '#topic-title',
       topicPrompt: '#topic-prompt',
@@ -152,22 +159,103 @@ class TandemApp {
     this.streamManager.on('teacher_alert', (payload) => {
       this.teacherBar.showAlert(payload);
     });
+
+    // Session artifacts (REQ-13 / REQ-14). These carry an enveloped entity rather than
+    // a widget payload: {schema_version, event_id, session_id, mode, quiz|note}.
+    this.streamManager.on('quiz.created', (payload) => {
+      if (payload?.quiz) this.quizWidget.renderQuiz(this.quizFromArtifact(payload.quiz));
+    });
+
+    this.streamManager.on('note.upserted', (payload) => {
+      this.notesPanel.upsert(payload);
+    });
+
+    this.streamManager.on('note.deleted', (payload) => {
+      this.notesPanel.remove(payload);
+    });
   }
 
   /**
-   * Binds DOM event listeners for toolbar actions, role switching, and simulations.
+   * Applies a session mode to the client UI (REQ-12).
+   *
+   * Algorithm:
+   * 1. Record the mode that subsequent session-creating calls will send.
+   * 2. Retitle the assistance panel for what that mode actually produces.
+   * 3. Show the teacher oversight dock only in language learning - there is no
+   *    instructor overseeing a work call, and its actions (nudge a quieter learner,
+   *    send a quiz) are meaningless there.
+   */
+  setSessionMode(mode) {
+    this.currentMode = mode === 'international_work' ? 'international_work' : 'language_learning';
+    const isLearning = this.currentMode === 'language_learning';
+
+    const scaffoldingTitle = document.getElementById('scaffolding-title');
+    if (scaffoldingTitle) {
+      scaffoldingTitle.textContent = isLearning
+        ? '✨ AI Pedagogical Insights'
+        : '✨ Terms, Intent & Clarifications';
+    }
+
+    const notesTitle = document.getElementById('notes-title');
+    if (notesTitle) {
+      notesTitle.textContent = isLearning ? '📝 Learning Notes' : '📝 Decisions & Actions';
+    }
+
+    this.teacherBar.setVisible(isLearning && this.isAiActive);
+    document.body.dataset.sessionMode = this.currentMode;
+  }
+
+  /**
+   * Locks or releases the mode switcher.
+   *
+   * The backend is the authority - it rejects a mid-session mode change with a 400 -
+   * so this only stops the user from making a request that is guaranteed to fail.
+   */
+  setModeSwitcherLocked(locked) {
+    document.querySelectorAll('#mode-switcher button').forEach((btn) => {
+      btn.disabled = locked;
+      btn.classList.toggle('locked', locked);
+    });
+  }
+
+  /**
+   * Adapts a stored QuizItem (REQ-13) to the widget's payload shape.
+   *
+   * The widget predates the artifact contract and speaks in question/options/correct
+   * index; the stored quiz speaks in prompt/expected answer. Translating here keeps the
+   * widget unaware of the artifact schema.
+   */
+  quizFromArtifact(quiz) {
+    const options = quiz.options || [];
+    return {
+      active: true,
+      question: quiz.prompt,
+      options,
+      correct_index: Math.max(0, options.indexOf(quiz.expected_answer)),
+      explanation: quiz.explanation || ''
+    };
+  }
+
+  /**
+   * Binds DOM event listeners for toolbar actions, mode switching, and simulations.
    */
   bindDomEvents() {
-    // Role switcher
-    const roleButtons = document.querySelectorAll('#role-switcher button');
-    roleButtons.forEach(btn => {
+    // Session mode switcher (REQ-12). The mode decides which assistance the backend
+    // runs and which note vocabulary it may emit, and it cannot change mid-session -
+    // artifacts already generated under the first mode would contradict the second.
+    const modeButtons = document.querySelectorAll('#mode-switcher button');
+    modeButtons.forEach(btn => {
       btn.addEventListener('click', () => {
-        roleButtons.forEach(b => b.classList.remove('active'));
+        if (this.isAiActive || this.isAiPending) {
+          console.warn('Session mode is fixed while a conversation is live. End it first.');
+          return;
+        }
+        modeButtons.forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
-        this.currentRole = btn.getAttribute('data-role');
-        this.teacherBar.setVisible(this.currentRole === 'teacher');
+        this.setSessionMode(btn.getAttribute('data-mode'));
       });
     });
+    this.setSessionMode(this.currentMode);
 
     // Join Channel Button
     const btnJoin = document.getElementById('btn-join');
@@ -585,7 +673,8 @@ class TandemApp {
     this.updateConvoAIUi('starting');
 
     try {
-      const agent = await this.convoai.startAgent(language);
+      this.setModeSwitcherLocked(true);
+      const agent = await this.convoai.startAgent(language, this.currentMode);
       console.log('🤖 Convo AI agent accepted:', agent);
 
       // Step 5: A simulated agent never produces a 'user-joined' event
@@ -628,6 +717,9 @@ class TandemApp {
     await this.convoai.stopAgent();
     this.isAiActive = false;
     this.isAiPending = false;
+    // The session is over, so its mode is no longer binding: the next one may differ.
+    this.setModeSwitcherLocked(false);
+    this.teacherBar.setVisible(false);
     this.updateConvoAIUi(reason ? 'error' : 'idle', reason);
     console.log('🛑 Convo AI agent stopped.');
   }
@@ -643,6 +735,7 @@ class TandemApp {
     }
     this.isAiPending = false;
     this.isAiActive = true;
+    this.teacherBar.setVisible(this.currentMode === 'language_learning');
     this.updateConvoAIUi('live');
   }
 

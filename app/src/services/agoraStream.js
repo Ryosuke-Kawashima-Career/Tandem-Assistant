@@ -108,7 +108,10 @@ export class AgoraStreamManager {
 
   /**
    * Registers a listener callback for a specific event type.
-   * Supported types: 'subtitles', 'idiom_card', 'topic_prompt', 'quiz', 'teacher_alert', 'speaking_balance', 'all'.
+   * Supported types: 'subtitles', 'idiom_card', 'topic_prompt', 'quiz', 'teacher_alert',
+   * 'speaking_balance', the session artifact events 'quiz.created' / 'note.upserted' /
+   * 'note.deleted' (REQ-13 / REQ-14), and 'all'. Unknown types register on demand, so a
+   * new event type needs no change here.
    * 
    * @param {string} eventType - The event name to listen for
    * @param {Function} callback - Callback function receiving (payload, metadata)

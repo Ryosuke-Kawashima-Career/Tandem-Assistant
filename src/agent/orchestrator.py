@@ -21,11 +21,16 @@ from src.agent.prompts import (
     SYSTEM_PROMPT_TANDEM_TEACHER,
     SYSTEM_PROMPT_TANDEM_TUTOR,
     SYSTEM_PROMPT_TANDEM_TUTOR_VOICE,
+    SYSTEM_PROMPT_INTERNATIONAL_WORK,
+    SYSTEM_PROMPT_INTERNATIONAL_WORK_VOICE,
     create_teaching_prompt,
     create_tutor_prompt,
     create_tutor_voice_prompt,
+    create_work_prompt,
+    create_work_voice_prompt,
     create_silence_breaker_prompt
 )
+from src.sessions.models import SessionMode
 
 logger = logging.getLogger("echosphere.agent.orchestrator")
 
@@ -281,6 +286,68 @@ class TeachingAgent:
             topic=topic
         )
 
+    @staticmethod
+    def resolve_session_mode(session_mode: Any) -> SessionMode:
+        """
+        Normalizes a session mode, defaulting to language learning (REQ-12).
+
+        The default exists for the ambient pipeline and the older REST callers, which
+        predate session modes; the creation APIs themselves reject a missing mode rather
+        than reaching this default.
+        """
+        if isinstance(session_mode, SessionMode):
+            return session_mode
+        try:
+            return SessionMode.parse(session_mode)
+        except Exception:
+            return SessionMode.LANGUAGE_LEARNING
+
+    def build_work_prompt(
+        self,
+        speaker_id: str,
+        detected_language: str = "en",
+        topic: Optional[str] = None
+    ) -> str:
+        """Builds the structured `international_work` prompt for one turn (REQ-12)."""
+        return create_work_prompt(
+            recent_context=self.format_history_context(),
+            working_language=self.native_language,
+            speaker_languages=self.observed_languages(),
+            speaker_name=speaker_id,
+            topic=topic
+        )
+
+    def build_work_voice_prompt(
+        self,
+        speaker_id: str,
+        text: str,
+        detected_language: str = "en",
+        topic: Optional[str] = None
+    ) -> str:
+        """Builds the voice-critical `international_work` prompt (REQ-LAT-02)."""
+        return create_work_voice_prompt(
+            recent_context=self.format_history_context(),
+            latest_utterance=text,
+            working_language=self.native_language,
+            speaker_name=speaker_id,
+            topic=topic
+        )
+
+    def observed_languages(self) -> List[str]:
+        """
+        Returns the distinct languages heard so far, most recent first.
+
+        Work sessions have no configured target language - the room's language mix is
+        whatever the participants actually used - so it is read off the history rather
+        than from constructor configuration.
+        """
+        seen: List[str] = []
+        for item in reversed(self.turn_history):
+            lang = item.get("lang")
+            if lang and lang not in seen:
+                seen.append(lang)
+        return seen
+
     def process_turn(
         self,
         speaker_id: str,
@@ -288,7 +355,8 @@ class TeachingAgent:
         detected_language: str = "ja",
         topic: Optional[str] = None,
         mode: str = "mediation",
-        record_turn: bool = True
+        record_turn: bool = True,
+        session_mode: Any = None
     ) -> Dict[str, Any]:
         """
         Processes a newly transcribed student turn and generates real-time pedagogical scaffolding.
@@ -323,8 +391,18 @@ class TeachingAgent:
         stats = self.get_speaker_balance_percentages()
         context_str = self.format_history_context()
 
-        # Step 3: Build prompt for the requested mode
-        if mode == "tutor":
+        # Step 3: Build prompt for the requested mode.
+        # The session mode (REQ-12) outranks the prompt mode: an `international_work`
+        # session never runs a tutor or mediation prompt, because both grade the
+        # speaker's language and a work call has nobody practising.
+        if self.resolve_session_mode(session_mode) is SessionMode.INTERNATIONAL_WORK:
+            prompt = self.build_work_prompt(
+                speaker_id=speaker_id,
+                detected_language=detected_language,
+                topic=topic
+            )
+            system_prompt = SYSTEM_PROMPT_INTERNATIONAL_WORK
+        elif mode == "tutor":
             prompt = self.build_tutor_prompt(
                 speaker_id=speaker_id,
                 detected_language=detected_language,
@@ -362,7 +440,8 @@ class TeachingAgent:
         speaker_id: str,
         text: str,
         detected_language: str = "ja",
-        topic: Optional[str] = None
+        topic: Optional[str] = None,
+        session_mode: Any = None
     ) -> Iterator[str]:
         """
         Streams the spoken 1:1 reply as plain text deltas (REQ-LAT-02 / REQ-LAT-03).
@@ -399,12 +478,23 @@ class TeachingAgent:
 
         # Step 2: Build the voice prompt from history *excluding* the utterance itself,
         # which is passed separately so the model sees clearly what to answer.
-        prompt = self.build_tutor_voice_prompt(
-            speaker_id=speaker_id,
-            text=text,
-            detected_language=detected_language,
-            topic=topic
-        )
+        resolved_mode = self.resolve_session_mode(session_mode)
+        if resolved_mode is SessionMode.INTERNATIONAL_WORK:
+            prompt = self.build_work_voice_prompt(
+                speaker_id=speaker_id,
+                text=text,
+                detected_language=detected_language,
+                topic=topic
+            )
+            voice_system_prompt = SYSTEM_PROMPT_INTERNATIONAL_WORK_VOICE
+        else:
+            prompt = self.build_tutor_voice_prompt(
+                speaker_id=speaker_id,
+                text=text,
+                detected_language=detected_language,
+                topic=topic
+            )
+            voice_system_prompt = SYSTEM_PROMPT_TANDEM_TUTOR_VOICE
 
         def _stream() -> Iterator[str]:
             started = time.time()
@@ -413,9 +503,9 @@ class TeachingAgent:
             # Step 3: Dispatch to the streaming provider leg
             try:
                 if self.engine in ("openai", "whisper") and self._openai_client:
-                    stream = self._stream_openai(prompt, SYSTEM_PROMPT_TANDEM_TUTOR_VOICE)
+                    stream = self._stream_openai(prompt, voice_system_prompt)
                 elif self.engine == "gemini" and self._gemini_client:
-                    stream = self._stream_gemini(prompt, SYSTEM_PROMPT_TANDEM_TUTOR_VOICE)
+                    stream = self._stream_gemini(prompt, voice_system_prompt)
                 else:
                     stream = self._mock_spoken_reply_stream(speaker_id, text, detected_language)
 

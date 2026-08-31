@@ -4,7 +4,8 @@ Summary:
     Agora SD-RTN™ RTC Data Streams in EchoSphere.
     It structures and synchronizes live UI payloads across all connected peers and teacher
     dashboards, including real-time tri-lingual subtitles, Romaji/transliterations,
-    cultural idiom cards, conversation prompts, quizzes, and speaking balance metrics.
+    cultural idiom cards, conversation prompts, quizzes, speaking balance metrics, and
+    the session artifact events (`quiz.created`, `note.upserted`, `note.deleted`).
 
 Key Classes:
     - DataStreamManager: Coordinates serializing, throttling, and broadcasting structured
@@ -163,6 +164,21 @@ class DataStreamManager:
             "severity": severity
         }
         return self._dispatch("teacher_alert", payload)
+
+    def send_artifact_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
+        """
+        Broadcasts a session artifact event: `quiz.created`, `note.upserted`, `note.deleted`.
+
+        Algorithm:
+        1. Accept an already-enveloped payload (schema version, event id, session, mode).
+        2. Forward it unchanged to _dispatch under the given event type.
+
+        Unlike the widget events above, the envelope is built by the artifact generator
+        rather than here: those events describe what to draw right now, while these
+        describe a stored entity, and the entity's id, revision, and session are what a
+        receiver deduplicates and files it by (spec section 5).
+        """
+        return self._dispatch(event_type, payload)
 
     def send_speaking_balance(self, speaker_stats: Dict[str, int]) -> bool:
         """

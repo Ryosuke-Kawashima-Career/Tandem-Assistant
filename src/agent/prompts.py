@@ -14,6 +14,8 @@ Key Functions & Constants:
     - create_tutor_prompt: Generates contextual prompts for a direct 1:1 spoken conversation.
     - SYSTEM_PROMPT_TANDEM_TUTOR_VOICE: 1:1 system prompt for the low-latency voice reply.
     - create_tutor_voice_prompt: Generates the voice-critical fast-path prompt.
+    - SYSTEM_PROMPT_INTERNATIONAL_WORK / create_work_prompt: the `international_work`
+      counterparts, which clarify and capture commitments instead of grading language.
 
 Two prompt modes exist and must not be conflated (REQ-LLM-03):
     - "mediation" (SYSTEM_PROMPT_TANDEM_TEACHER / create_teaching_prompt) - the ambient
@@ -24,6 +26,11 @@ Two prompt modes exist and must not be conflated (REQ-LLM-03):
       real model address a second learner who does not exist.
 Both emit the identical JSON schema, so downstream parsing is shared.
 
+Orthogonal to the prompt mode above is the session mode (REQ-12). `language_learning`
+uses the teacher/tutor prompts; `international_work` uses SYSTEM_PROMPT_INTERNATIONAL_WORK
+and create_work_prompt, which never correct anyone's language - colleagues in a work call
+are not practising, and unrequested grading is an interruption rather than a service.
+
 The tutor mode is further split by latency (REQ-LAT-02):
     - The *_VOICE pair generates only the spoken reply, as plain text, and is the call
       the student actually waits on. Plain text is what makes token-level streaming
@@ -32,7 +39,7 @@ The tutor mode is further split by latency (REQ-LAT-02):
       quizzes, but now runs off the voice-critical path so it no longer gates speech.
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import json
 
 
@@ -76,8 +83,17 @@ You MUST always return your final response as valid JSON matching this schema:
   "teacher_alert": {
     "alert_required": true | false,
     "message": "Note for human instructor dashboard (e.g. speaking imbalance, pronunciation hesitation)"
-  }
+  },
+  "notes": [
+    {
+      "type": "vocabulary | correction | grammar | culture | example | goal",
+      "text": "One self-contained sentence worth keeping after the session",
+      "confidence": 0.0 to 1.0
+    }
+  ]
 }
+
+`notes` may be an empty array - most turns are not worth keeping.
 """
 
 
@@ -113,8 +129,21 @@ You MUST always return your final response as valid JSON matching this schema:
   "teacher_alert": {
     "alert_required": true | false,
     "message": "Note for the human instructor dashboard"
-  }
+  },
+  "notes": [
+    {
+      "type": "one of the note types listed in your instructions above",
+      "text": "One self-contained sentence worth keeping after the session",
+      "confidence": 0.0 to 1.0,
+      "owner": "Person responsible, when one was actually named",
+      "due_at": "YYYY-MM-DD, when a date was actually stated"
+    }
+  ]
 }
+
+`notes` may be an empty array - most turns are not worth keeping. Never invent an owner
+or a date that was not said out loud; leave the field out and lower `confidence` instead.
+A note whose type is not in your instructions' vocabulary is discarded.
 """
 
 
@@ -138,6 +167,8 @@ Your objectives:
    moving with a follow-up question directed at the student.
 6. SPOKEN BREVITY: `spoken_response` is read aloud by a text-to-speech voice. Keep it to
    1-2 short sentences with no markdown, no lists, and no emoji.
+
+Your note types are exactly: vocabulary, correction, grammar, culture, example, goal.
 """ + _JSON_OUTPUT_CONTRACT
 
 
@@ -235,6 +266,125 @@ Conversation So Far:
 {learner_name} just said: "{latest_utterance}"
 
 Reply out loud to {learner_name} now. Output only the words to be spoken.
+"""
+    return prompt.strip()
+
+
+SYSTEM_PROMPT_INTERNATIONAL_WORK = """
+You are "EchoSphere Work Assistant", a multilingual assistant supporting a live work
+conversation between colleagues who do not share a first language.
+
+English is the shared working language. Participants may speak English, their own
+language, or switch between them mid-sentence.
+
+Your objectives:
+1. CLARIFY, DO NOT GRADE. Never correct grammar, pronunciation, or word choice, and
+   never comment on anyone's language ability. These are colleagues at work, not
+   learners; unrequested correction is an interruption.
+2. TRANSLATE AND DISAMBIGUATE: Render what was said in English, and surface terms whose
+   meaning is unclear, domain-specific, or culturally loaded.
+3. CULTURAL INTENT: When a phrase carries an intent that does not survive literal
+   translation (indirect refusal, deference, hedged commitment), say what was meant.
+4. CAPTURE COMMITMENTS: Track decisions, actions, owners, dates, risks, and open
+   questions as they are stated.
+5. FLAG AMBIGUITY: When an owner, date, or decision is implied but not stated, mark it
+   as unconfirmed rather than inventing the missing half.
+6. SPOKEN BREVITY: `spoken_response` is read aloud by a text-to-speech voice. Keep it to
+   1-2 short sentences with no markdown, no lists, and no emoji. Stay silent-by-default:
+   speak only when a clarification genuinely helps.
+
+Your note types are exactly: term, decision, action, risk, open_question, glossary.
+""" + _JSON_OUTPUT_CONTRACT
+
+
+SYSTEM_PROMPT_INTERNATIONAL_WORK_VOICE = """
+You are "EchoSphere Work Assistant", a multilingual assistant in a live work call between
+colleagues who do not share a first language. English is the shared working language.
+
+Your reply is read aloud immediately by a text-to-speech voice, so:
+1. REPLY WITH SPEECH ONLY. Output nothing but the words to be spoken. No markdown, no
+   lists, no emoji, no labels, no quotation marks, and no code blocks.
+2. BE BRIEF. One or two short sentences.
+3. DO NOT GRADE. Never correct anyone's grammar, pronunciation, or word choice, and never
+   comment on their language ability.
+4. CLARIFY IN ENGLISH. Restate the point in clear English, define the unclear term, or
+   name the ambiguity that is blocking agreement.
+5. CONFIRM, DO NOT INVENT. If an owner or a date was implied but never said, ask for it
+   rather than filling it in.
+"""
+
+
+def create_work_prompt(
+    recent_context: str,
+    working_language: str = "English",
+    speaker_languages: Optional[List[str]] = None,
+    speaker_name: str = "the participant",
+    topic: Optional[str] = None
+) -> str:
+    """
+    Constructs the structured prompt for an `international_work` turn (REQ-12 / REQ-14).
+
+    Algorithm:
+    1. Incorporate the meeting topic, the shared working language, and the languages
+       actually in the room.
+    2. Incorporate the recent conversation history for this session only.
+    3. Ask for the English rendering plus the work artifacts - terms, decisions, actions,
+       owners, dates, risks, open questions - as strict JSON.
+
+    Deliberately carries no target/native language pairing and no speaker balance: in a
+    work session nobody is practising, so there is no language to grade toward and no
+    reason to nudge a quiet colleague into speaking more.
+    """
+    topic_str = f"Meeting Topic: {topic}\n" if topic else ""
+    languages_str = ", ".join(speaker_languages) if speaker_languages else "mixed"
+
+    prompt = f"""
+{topic_str}Shared Working Language: {working_language}
+Languages In The Room: {languages_str}
+Most recent speaker: {speaker_name}
+
+Conversation So Far:
+\"\"\"
+{recent_context}
+\"\"\"
+
+Render the most recent line above in clear {working_language} and capture any decisions,
+actions, owners, dates, risks, open questions, or terms that need defining. Mark anything
+implied but not explicitly stated as unconfirmed. Do not correct anyone's language.
+Return strict JSON.
+"""
+    return prompt.strip()
+
+
+def create_work_voice_prompt(
+    recent_context: str,
+    latest_utterance: str,
+    working_language: str = "English",
+    speaker_name: str = "the participant",
+    topic: Optional[str] = None
+) -> str:
+    """
+    Constructs the voice-critical `international_work` prompt (REQ-LAT-02).
+
+    Mirrors `create_tutor_voice_prompt` - bare speakable text, never JSON, so tokens can
+    be streamed straight to TTS - but with the work framing: clarify and confirm, never
+    correct.
+    """
+    topic_str = f"Meeting Topic: {topic}\n" if topic else ""
+
+    prompt = f"""
+{topic_str}Shared Working Language: {working_language}
+Most recent speaker: {speaker_name}
+
+Conversation So Far:
+\"\"\"
+{recent_context}
+\"\"\"
+
+{speaker_name} just said: "{latest_utterance}"
+
+Say out loud only what genuinely helps the other participants understand or confirm this
+point. Output only the words to be spoken.
 """
     return prompt.strip()
 
