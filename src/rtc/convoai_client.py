@@ -21,6 +21,7 @@ import uuid
 import base64
 import logging
 from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse
 from dataclasses import dataclass, field, asdict
 
 from src.rtc.agora_client import AgoraVoiceChannelClient, is_usable_credential
@@ -94,6 +95,47 @@ class ConvoAIAgentSession:
         return asdict(self)
 
 
+# Hosts that can never be reached from Agora's network. The Convo AI Engine calls the
+# Custom LLM bridge from Agora's own infrastructure, so a loopback URL there resolves to
+# Agora's machine, not to this one - a probe from here would succeed and prove nothing.
+LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+
+# ngrok's local agent exposes the tunnel it is currently serving. Used to tell a *stale*
+# CONVOAI_LLM_BASE_URL from a missing tunnel: a free ngrok domain changes on restart, so
+# a stale value in .env is the expected steady state on a developer machine.
+NGROK_LOCAL_API = "http://127.0.0.1:4040/api/tunnels"
+
+# How long to wait for the bridge to answer. Short on purpose: this runs in front of a
+# button press, and a bridge that needs more than a couple of seconds to serve /health
+# will not survive a live turn either.
+BRIDGE_CHECK_TIMEOUT_SECONDS = 3.0
+
+
+@dataclass
+class BridgeCheck:
+    """
+    The result of probing the Custom LLM bridge (REQ-11).
+
+    Carries the URL it tried so the outcome is actionable on its own - a caller
+    reporting this to a person should never have to re-read the configuration to say
+    which address failed.
+    """
+
+    url: str
+    reachable: bool
+    status_code: Optional[int] = None
+    detail: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serializes the check for API responses and logs."""
+        return {
+            "url": self.url,
+            "reachable": self.reachable,
+            "status_code": self.status_code,
+            "detail": self.detail,
+        }
+
+
 class ConvoAIClient:
     """
     Manages Agora Conversational AI agent sessions over the Convo AI REST API.
@@ -159,6 +201,129 @@ class ConvoAIClient:
             and not self.customer_id.startswith("your_")
             and not self.customer_secret.startswith("your_")
         )
+
+    def check_llm_bridge(
+        self,
+        timeout: float = BRIDGE_CHECK_TIMEOUT_SECONDS
+    ) -> BridgeCheck:
+        """
+        Probes whether the Convo AI Engine could reach this backend's Custom LLM bridge.
+
+        Algorithm:
+        1. Reject a loopback URL outright - it is unreachable from Agora's network by
+           definition, and no probe from this machine can demonstrate otherwise.
+        2. GET `<llm_base_url>/health`, suppressing ngrok's browser interstitial.
+        3. Treat any non-200 as unreachable: a dead tunnel still answers with an HTTP
+           response (ngrok serves its own 404 page), so "the request completed" is not
+           the question - "did the EchoSphere backend answer" is.
+
+        Never raises: the caller is deciding whether to start an agent, and a probe that
+        throws would take down the very path it exists to protect.
+        """
+        url = self.llm_base_url.rstrip("/")
+        host = (urlparse(url).hostname or "").lower()
+
+        if host in LOOPBACK_HOSTS:
+            return BridgeCheck(
+                url=url,
+                reachable=False,
+                detail=(
+                    f"'{url}' is a loopback address. The Convo AI Engine calls this "
+                    f"backend from Agora's network, so the bridge must be a public URL "
+                    f"(for example an ngrok tunnel)."
+                )
+            )
+
+        if not REQUESTS_AVAILABLE:
+            return BridgeCheck(
+                url=url, reachable=False,
+                detail="The 'requests' package is unavailable, so the bridge cannot be probed."
+            )
+
+        try:
+            response = requests.get(
+                f"{url}/health",
+                timeout=timeout,
+                headers={"ngrok-skip-browser-warning": "1"}
+            )
+        except Exception as exc:
+            return BridgeCheck(
+                url=url, reachable=False,
+                detail=f"{type(exc).__name__}: {exc}"
+            )
+
+        if response.status_code != 200:
+            return BridgeCheck(
+                url=url, reachable=False, status_code=response.status_code,
+                detail=(
+                    f"{url}/health answered {response.status_code}. The address is "
+                    f"resolving to something other than this backend - most often a "
+                    f"tunnel that is no longer running."
+                )
+            )
+
+        return BridgeCheck(
+            url=url, reachable=True, status_code=200,
+            detail="The Custom LLM bridge is publicly reachable."
+        )
+
+    def detect_local_tunnel_url(self, timeout: float = 1.0) -> Optional[str]:
+        """
+        Returns the public URL of a tunnel running locally, or None.
+
+        Used to distinguish a *stale* `CONVOAI_LLM_BASE_URL` from a missing tunnel, which
+        are the same symptom with different fixes. Silent when no local agent is running:
+        the tunnel is optional infrastructure, not a dependency.
+        """
+        if not REQUESTS_AVAILABLE:
+            return None
+
+        try:
+            response = requests.get(NGROK_LOCAL_API, timeout=timeout)
+            if response.status_code != 200:
+                return None
+            tunnels = response.json().get("tunnels") or []
+        except Exception:
+            return None
+
+        for tunnel in tunnels:
+            public_url = tunnel.get("public_url", "")
+            if public_url.startswith("https://"):
+                return public_url
+
+        return tunnels[0].get("public_url") if tunnels else None
+
+    def describe_bridge_problem(self, check: BridgeCheck) -> str:
+        """
+        Turns a failed check into the message a person can act on.
+
+        Names the address that failed, what was observed, and the two repairs - start the
+        tunnel, or point the configuration at the one that is already running. The second
+        is included only when a local tunnel really is serving a different URL, so the
+        advice is never speculative.
+        """
+        lines = [
+            f"The Convo AI Engine cannot reach this backend's Custom LLM bridge at "
+            f"{check.url}. {check.detail}"
+        ]
+
+        live_url = self.detect_local_tunnel_url()
+        if live_url and live_url.rstrip("/") != check.url.rstrip("/"):
+            lines.append(
+                f"A tunnel is running locally on {live_url} - set "
+                f"CONVOAI_LLM_BASE_URL to that value and restart the server."
+            )
+        else:
+            lines.append(
+                "Start the tunnel (ngrok http 8000) and set CONVOAI_LLM_BASE_URL to its "
+                "public URL, then restart the server."
+            )
+
+        lines.append(
+            "Set CONVOAI_SKIP_BRIDGE_PREFLIGHT=1 to start an agent anyway; it will join "
+            "the channel but stay silent."
+        )
+        return " ".join(lines)
 
     def _auth_header(self) -> str:
         """

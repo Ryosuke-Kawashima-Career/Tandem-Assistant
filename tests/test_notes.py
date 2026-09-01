@@ -270,7 +270,7 @@ class TestNotesApiIntegration(unittest.TestCase):
             speaker_id="Priya", text="नमस्ते",
             language="hi", channel="note-channel"
         )
-        return self.app.get("/api/session/notes?channel=note-channel").get_json()["notes"]
+        return self.app.get("/api/session/notes?channel=note-channel&actor=Learner").get_json()["notes"]
 
     def test_a_finalized_turn_upserts_retrievable_notes(self):
         """Verify every finalized turn leaves a retrievable, source-linked note."""
@@ -285,10 +285,10 @@ class TestNotesApiIntegration(unittest.TestCase):
         """Verify deletion is honored through the API, not only in the repository."""
         note_id = self.start_learning_turn()[0]["id"]
 
-        deleted = self.app.delete(f"/api/session/notes/{note_id}?channel=note-channel")
+        deleted = self.app.delete(f"/api/session/notes/{note_id}?channel=note-channel&actor=Learner")
 
         self.assertEqual(deleted.status_code, 200)
-        remaining = self.app.get("/api/session/notes?channel=note-channel").get_json()["notes"]
+        remaining = self.app.get("/api/session/notes?channel=note-channel&actor=Learner").get_json()["notes"]
         self.assertNotIn(note_id, [note["id"] for note in remaining])
 
     def test_the_ambient_rest_turn_path_also_captures_notes(self):
@@ -306,7 +306,7 @@ class TestNotesApiIntegration(unittest.TestCase):
         })
 
         notes = self.app.get(
-            "/api/session/notes?channel=tokyo-mumbai-101"
+            "/api/session/notes?channel=tokyo-mumbai-101&actor=Priya"
         ).get_json()["notes"]
         self.assertTrue(notes)
 
@@ -326,7 +326,7 @@ class TestNotesApiIntegration(unittest.TestCase):
         })
 
         notes = self.app.get(
-            "/api/session/notes?channel=ambient-channel"
+            "/api/session/notes?channel=ambient-channel&actor=Priya"
         ).get_json()["notes"]
         self.assertTrue(notes)
 
@@ -334,7 +334,7 @@ class TestNotesApiIntegration(unittest.TestCase):
         """Verify a stale client deleting twice gets a miss rather than a second event."""
         self.start_learning_turn()
 
-        response = self.app.delete("/api/session/notes/note-does-not-exist?channel=note-channel")
+        response = self.app.delete("/api/session/notes/note-does-not-exist?channel=note-channel&actor=Learner")
 
         self.assertEqual(response.status_code, 404)
 

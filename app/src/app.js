@@ -16,6 +16,7 @@
 import AgoraRTC from 'agora-rtc-sdk-ng';
 import { AgoraStreamManager } from './services/agoraStream.js';
 import { ConvoAIService } from './services/convoai.js';
+import { requestJson } from './services/http.js';
 import { ConvoAITranscriptService } from './services/convoaiTranscript.js';
 import { Subtitles } from './components/Subtitles.js';
 import { IdiomCard } from './components/IdiomCard.js';
@@ -47,6 +48,11 @@ class TandemApp {
     this.agoraClient = null;
     this.localUid = Math.floor(Math.random() * 100000) + 1000;
 
+    // Identity the backend authorizes artifact access against (REQ-16). It is also the
+    // speaker id sent with a Convo AI session, so the participant recorded on the
+    // session and the actor asking for its notes are the same person.
+    this.speakerId = 'Learner';
+
     // Convo AI state (REQ-09)
     this.convoai = new ConvoAIService(this.channelName);
     this.isAiActive = false;
@@ -70,6 +76,7 @@ class TandemApp {
       emptyHint: '#notes-empty-hint',
       countBadge: '#notes-count'
     });
+    this.notesPanel.onDelete = (noteId) => this.deleteNote(noteId);
     this.topicWidget = new TopicWidget({
       topicTitle: '#topic-title',
       topicPrompt: '#topic-prompt',
@@ -102,17 +109,14 @@ class TandemApp {
    */
   async checkBackendConnection() {
     try {
-      const res = await fetch('/health');
-      if (res.ok) {
-        const data = await res.json();
-        const connStatus = document.getElementById('connection-status');
-        const connDot = document.getElementById('connection-dot');
-        if (connStatus) connStatus.textContent = `Backend Live (v${data.version})`;
-        if (connDot) connDot.style.backgroundColor = 'var(--macos-accent-green)';
-        console.log('✅ Connected to EchoSphere Backend API:', data);
-      }
+      const data = await requestJson('/health');
+      const connStatus = document.getElementById('connection-status');
+      const connDot = document.getElementById('connection-dot');
+      if (connStatus) connStatus.textContent = `Backend Live (v${data.version})`;
+      if (connDot) connDot.style.backgroundColor = 'var(--macos-accent-green)';
+      console.log('✅ Connected to EchoSphere Backend API:', data);
     } catch (err) {
-      console.log('ℹ️ Running in standalone offline mode:', err);
+      console.log('ℹ️ Running in standalone offline mode:', err.message);
     }
   }
 
@@ -173,6 +177,38 @@ class TandemApp {
     this.streamManager.on('note.deleted', (payload) => {
       this.notesPanel.remove(payload);
     });
+  }
+
+  /**
+   * Opens this channel's stored session artifact as Markdown (REQ-15).
+   *
+   * The actor travels with the request because the backend authorizes artifact access
+   * against the session's participants (REQ-16).
+   */
+  exportSession() {
+    const url = `/api/session/artifact/export?channel=${encodeURIComponent(this.channelName)}`
+      + `&format=markdown&actor=${encodeURIComponent(this.speakerId)}`;
+    window.open(url, '_blank', 'noopener');
+  }
+
+  /**
+   * Deletes one stored note (REQ-14 / REQ-16).
+   *
+   * The panel is not updated optimistically: the server answers with `note.deleted` over
+   * the data stream, and letting that single path drive the UI keeps every viewer of the
+   * session in agreement about what was removed.
+   */
+  async deleteNote(noteId) {
+    try {
+      const url = `/api/session/notes/${encodeURIComponent(noteId)}`
+        + `?channel=${encodeURIComponent(this.channelName)}`
+        + `&actor=${encodeURIComponent(this.speakerId)}`;
+      const body = await requestJson(url, { method: 'DELETE' });
+      // Offline and simulated sessions never receive the RTC event, so reflect it here.
+      this.notesPanel.remove(body);
+    } catch (err) {
+      console.warn('Could not delete the note:', err.message);
+    }
   }
 
   /**
@@ -256,6 +292,14 @@ class TandemApp {
       });
     });
     this.setSessionMode(this.currentMode);
+
+    // Export the stored session (REQ-15). Opened in a new tab rather than fetched and
+    // re-rendered: the export is a document, and the browser already knows how to show
+    // and save one.
+    const btnExport = document.getElementById('btn-export');
+    if (btnExport) {
+      btnExport.addEventListener('click', () => this.exportSession());
+    }
 
     // Join Channel Button
     const btnJoin = document.getElementById('btn-join');
@@ -674,7 +718,7 @@ class TandemApp {
 
     try {
       this.setModeSwitcherLocked(true);
-      const agent = await this.convoai.startAgent(language, this.currentMode);
+      const agent = await this.convoai.startAgent(language, this.currentMode, this.speakerId);
       console.log('🤖 Convo AI agent accepted:', agent);
 
       // Step 5: A simulated agent never produces a 'user-joined' event

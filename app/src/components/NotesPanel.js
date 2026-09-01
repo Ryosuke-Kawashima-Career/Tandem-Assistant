@@ -46,6 +46,18 @@ export class NotesPanel {
     this.emptyHint = document.querySelector(options.emptyHint || '#notes-empty-hint');
     this.countBadge = document.querySelector(options.countBadge || '#notes-count');
     this.notes = new Map();
+    this.onDelete = null;
+
+    // Delegated rather than bound per card: the list is redrawn on every event, and
+    // per-card listeners would be re-attached (and leak) on each redraw.
+    if (this.container) {
+      this.container.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-note-delete]');
+        if (button && this.onDelete) {
+          this.onDelete(button.getAttribute('data-note-delete'));
+        }
+      });
+    }
   }
 
   /**
@@ -130,7 +142,10 @@ export class NotesPanel {
       <div class="note-card${unconfirmed ? ' needs-confirmation' : ''}" data-note-id="${this.escape(note.id)}">
         <div class="note-card-header">
           <span class="note-type-badge">${icon} ${this.escape(note.type)}</span>
-          ${unconfirmed ? '<span class="note-status-pill">needs confirmation</span>' : ''}
+          <span class="note-card-actions">
+            ${unconfirmed ? '<span class="note-status-pill">needs confirmation</span>' : ''}
+            <button class="note-delete-btn" data-note-delete="${this.escape(note.id)}" title="Delete this note">✕</button>
+          </span>
         </div>
         <div class="note-text">${this.escape(note.text)}</div>
         ${meta ? `<div class="note-meta">${meta}</div>` : ''}

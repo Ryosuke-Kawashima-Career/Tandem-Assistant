@@ -221,7 +221,7 @@ class TestQuizApiIntegration(unittest.TestCase):
             language="hi", channel="quiz-channel"
         )
 
-        response = self.app.get("/api/session/quizzes?channel=quiz-channel")
+        response = self.app.get("/api/session/quizzes?channel=quiz-channel&actor=Learner")
         self.assertEqual(response.status_code, 200)
         quizzes = response.get_json()["quizzes"]
         self.assertEqual(len(quizzes), 1)
@@ -238,7 +238,7 @@ class TestQuizApiIntegration(unittest.TestCase):
             speaker_id="Priya", text="Namaste", language="hi", channel="work-quiz-channel"
         )
 
-        response = self.app.get("/api/session/quizzes?channel=work-quiz-channel")
+        response = self.app.get("/api/session/quizzes?channel=work-quiz-channel&actor=Learner")
         self.assertEqual(response.get_json()["quizzes"], [])
 
 

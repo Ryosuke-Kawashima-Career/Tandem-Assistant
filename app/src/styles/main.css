@@ -1035,3 +1035,33 @@ body {
   opacity: 0.55;
   cursor: not-allowed;
 }
+
+
+.note-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.note-delete-btn {
+  border: none;
+  background: transparent;
+  color: var(--macos-text-secondary);
+  font-size: 12px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--macos-duration-normal) ease;
+}
+
+.note-card:hover .note-delete-btn,
+.note-delete-btn:focus-visible {
+  opacity: 1;
+}
+
+.note-delete-btn:hover {
+  background: rgba(255, 59, 48, 0.12);
+  color: var(--macos-accent-red, #ff3b30);
+}

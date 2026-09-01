@@ -28,6 +28,8 @@ Summary:
 """
 
 import os
+import tempfile
+
 import dotenv
 
 # Patched on the module object, not just this file's local name: src/server.py does
@@ -46,6 +48,13 @@ os.environ["CONVOAI_LLM_BASE_URL"] = "http://localhost:8000"
 # developer's shell happens to have exported. Tests that need a specific engine pass
 # engine=/*_api_key= explicitly as constructor arguments (which override these), or
 # scope their own patch.dict override - neither is weakened by this default.
+# REQ-15's local artifact repository writes session files to ECHOSPHERE_DATA_DIR, which
+# defaults to ./data/artifacts inside the repository. Point it at a throwaway directory
+# before src.server is imported: a test run must not deposit artifacts in the working
+# tree, and must not read a developer's real stored sessions back into its assertions.
+os.environ["ECHOSPHERE_DATA_DIR"] = tempfile.mkdtemp(prefix="echosphere-test-artifacts-")
+os.environ["ECHOSPHERE_ARTIFACT_RETENTION_DAYS"] = ""
+
 os.environ["ECHOSPHERE_ENGINE"] = "mock"
 os.environ["OPENAI_API_KEY"] = ""
 os.environ["GEMINI_API_KEY"] = ""

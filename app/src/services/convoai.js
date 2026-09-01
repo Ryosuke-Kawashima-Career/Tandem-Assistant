@@ -12,6 +12,8 @@
  *   - ConvoAIService: REST bridge to /api/convoai/* and /api/rtc/token.
  */
 
+import { requestJson } from './http.js';
+
 export class ConvoAIService {
   /**
    * Initialize the Convo AI service client.
@@ -35,13 +37,11 @@ export class ConvoAIService {
    */
   async fetchRtcCredentials(uid = 0) {
     try {
-      const res = await fetch(
+      return await requestJson(
         `/api/rtc/token?channel=${encodeURIComponent(this.channelName)}&uid=${uid}`
       );
-      if (!res.ok) return null;
-      return await res.json();
     } catch (err) {
-      console.warn('Could not fetch RTC credentials:', err);
+      console.warn('Could not fetch RTC credentials:', err.message);
       return null;
     }
   }
@@ -54,20 +54,24 @@ export class ConvoAIService {
    * before treating the AI as live.
    *
    * @param {string} language - Target language: 'hi', 'ja', or 'en'
+   * @param {string} speakerId - The learner's identity. Recorded as the session's
+   *   participant, which is what artifact access is later authorized against (REQ-16).
    * @param {string} mode - Session mode: 'language_learning' or 'international_work'.
    *   Required by the backend (REQ-12); a missing or unknown value is a 400, never a
    *   silent default, because every artifact the session produces is mode-shaped.
    * @returns {Promise<Object>} Agent descriptor including agent_id and status
    */
-  async startAgent(language = 'en', mode = 'language_learning') {
-    const res = await fetch('/api/convoai/start', {
+  async startAgent(language = 'en', mode = 'language_learning', speakerId = 'Learner') {
+    // requestJson, not fetch + res.json(): a non-JSON answer here is the difference
+    // between "the backend refused and said why" and an unreadable parse error, and
+    // this is the call a learner triggers by pressing a button.
+    const data = await requestJson('/api/convoai/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel: this.channelName, language, mode })
+      body: JSON.stringify({ channel: this.channelName, language, mode, speaker_id: speakerId })
     });
 
-    const data = await res.json();
-    if (!res.ok || !data.success) {
+    if (!data.success) {
       throw new Error(data.error || 'Failed to start the AI co-teacher.');
     }
 
@@ -84,15 +88,16 @@ export class ConvoAIService {
     const agentId = this.activeAgent ? this.activeAgent.agent_id : null;
 
     try {
-      const res = await fetch('/api/convoai/stop', {
+      const data = await requestJson('/api/convoai/stop', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ channel: this.channelName, agent_id: agentId })
       });
-      const data = await res.json();
       return Boolean(data.success);
     } catch (err) {
-      console.warn('Failed to stop the AI co-teacher:', err);
+      // A 404 means the agent was already gone, which is a successful outcome for the
+      // caller: either way no agent is attached to this channel any more.
+      console.warn('Failed to stop the AI co-teacher:', err.message);
       return false;
     } finally {
       this.activeAgent = null;
@@ -106,10 +111,9 @@ export class ConvoAIService {
    */
   async getStatus() {
     try {
-      const res = await fetch(
+      const data = await requestJson(
         `/api/convoai/status?channel=${encodeURIComponent(this.channelName)}`
       );
-      const data = await res.json();
       return data.agent || null;
     } catch (err) {
       return null;

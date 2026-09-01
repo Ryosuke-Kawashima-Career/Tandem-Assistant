@@ -38,9 +38,13 @@ load_dotenv(override=True)
 
 from src.rtc.agora_client import AgoraVoiceChannelClient, is_usable_credential
 from src.rtc.data_stream import DataStreamManager
+from src.artifacts.access import AccessDeniedError, require_access, resolve_actor
+from src.artifacts.adapters import ExportNotConfiguredError, NotionExportAdapter
+from src.artifacts.export import render_markdown
 from src.artifacts.generator import ArtifactGenerator
-from src.artifacts.models import stable_entity_id
-from src.sessions.models import InvalidSessionModeError, SessionMode
+from src.artifacts.models import TranscriptTurn
+from src.artifacts.repository import LocalArtifactRepository, configured_retention_days
+from src.sessions.models import InvalidSessionModeError, SessionMode, SessionRecord
 from src.sessions.service import SessionService
 from src.rtc.convoai_client import (
     ConvoAIClient,
@@ -69,6 +73,11 @@ SSE_CHUNK_CHARS = 24
 # Delay before the post-join agent health poll (REQ-LLM-09). Long enough for the Engine
 # to move the agent past STARTING, short enough to see a failure before the learner has
 # given up waiting for a voice.
+# Seconds to wait after startup before probing the Custom LLM bridge. Long enough for
+# Flask to be listening, so a tunnel that forwards to this process is not reported dead
+# while the process is still binding its socket.
+BRIDGE_BOOT_CHECK_DELAY_SECONDS = 3.0
+
 CONVOAI_HEALTH_POLL_DELAY_SECONDS = float(os.getenv("CONVOAI_HEALTH_POLL_DELAY_SECONDS", "5"))
 
 # Shared worker pool for Custom LLM turns. Module-level and never shut down: a
@@ -126,8 +135,16 @@ class EchoSphereServer:
         # Session artifacts (REQ-13 / REQ-14). Generation is driven from the finalized
         # turn, off the voice-critical path, and publishes quiz.created / note.upserted
         # over the same RTC data stream the scaffolding widgets already use.
-        self.artifact_generator = ArtifactGenerator(data_stream=self.data_stream)
-        self.artifacts = self.artifact_generator.repository
+        # REQ-15: the local repository is the MVP source of truth, so it is durable -
+        # a session's notes must outlive both the conversation and the process. Retention
+        # (REQ-16) is opt-in and applied at startup.
+        self.artifacts = LocalArtifactRepository(retention_days=configured_retention_days())
+        self.artifact_generator = ArtifactGenerator(
+            repository=self.artifacts, data_stream=self.data_stream
+        )
+        purged = self.artifacts.purge_expired()
+        if purged:
+            logger.info("Retention purge removed %d stored session artifact(s).", purged)
 
         self.is_active = False
 
@@ -167,6 +184,7 @@ class EchoSphereServer:
             languages=[language],
             participants=[speaker_id]
         )
+        self.artifacts.save_session(session)
         context = {
             "channel": channel,
             "language": language,
@@ -189,7 +207,10 @@ class EchoSphereServer:
         Drops the session context for a channel and resets conversation state (REQ-LLM-05).
         """
         self.convoai_session_context.pop(channel, None)
-        self.sessions.end_session(channel)
+        closed = self.sessions.end_session(channel)
+        if closed is not None:
+            # Stamp the stored artifact with the end time; it outlives the session.
+            self.artifacts.save_session(closed)
         if self._convoai_last_channel == channel:
             self._convoai_last_channel = None
         self.agent.reset_state()
@@ -210,6 +231,62 @@ class EchoSphereServer:
         if self._convoai_last_channel:
             return self.convoai_session_context.get(self._convoai_last_channel, {})
         return {}
+
+    def announce_note_change(
+        self,
+        note: Any,
+        meta: Dict[str, Any],
+        event_type: str = "note.upserted"
+    ) -> bool:
+        """
+        Publishes a note event for a session identified only by its stored metadata.
+
+        The generator's event path takes a live `SessionRecord`, but an edit can arrive
+        after the session ended and its registry entry is gone - so the record is rebuilt
+        from what the artifact store kept. Never raises: an unannounced edit is a stale
+        panel, while a raised exception here loses the edit itself.
+        """
+        if note is None:
+            return False
+
+        try:
+            session = SessionRecord(
+                session_id=meta["session_id"],
+                mode=SessionMode.parse(meta.get("mode") or SessionMode.LANGUAGE_LEARNING),
+                channel=meta.get("channel") or "",
+                languages=list(meta.get("languages") or []),
+                participants=list(meta.get("participants") or [])
+            )
+            return self.artifact_generator._emit(
+                event_type, session, "note", note.to_dict(), note.revision
+            )
+        except Exception as exc:
+            logger.warning("Could not announce %s for note %s: %s", event_type, note.id, exc)
+            return False
+
+    def resolve_artifact_session(
+        self,
+        channel: Optional[str] = None,
+        session_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolves the session an artifact request is about, live or already ended.
+
+        An explicit `session_id` wins; otherwise the channel's active session is used,
+        falling back to the most recent stored session on that channel. The fallback is
+        the point: someone asks for the notes *after* hanging up, when the live session
+        registry no longer holds anything.
+        """
+        if session_id:
+            return self.artifacts.get_session_meta(session_id)
+
+        if channel:
+            live = self.sessions.get_session(channel)
+            if live is not None:
+                return live.to_dict()
+            return self.artifacts.find_session_by_channel(channel)
+
+        return None
 
     def session_mode_for(self, channel: Optional[str] = None) -> SessionMode:
         """
@@ -297,7 +374,7 @@ class EchoSphereServer:
         # (REQ-13 / REQ-14) - an ambient peer turn is as finalized as a Convo AI one.
         self._broadcast_turn_payloads(turn_result, speaker_id, spoken_text)
         self.generate_turn_artifacts(
-            turn_result, speaker_id, spoken_text, channel or self.channel_name
+            turn_result, speaker_id, spoken_text, channel or self.channel_name, detected_lang
         )
 
         # Step 4: AI Speech Synthesis & RTC Audio Track
@@ -413,7 +490,7 @@ class EchoSphereServer:
         )
 
         self._broadcast_turn_payloads(turn_result, speaker_id, text)
-        self.generate_turn_artifacts(turn_result, speaker_id, text, channel)
+        self.generate_turn_artifacts(turn_result, speaker_id, text, channel, language)
         return turn_result
 
     def generate_turn_artifacts(
@@ -421,7 +498,8 @@ class EchoSphereServer:
         turn_result: Dict[str, Any],
         speaker_id: str,
         text: str,
-        channel: Optional[str] = None
+        channel: Optional[str] = None,
+        language: str = ""
     ) -> Dict[str, Any]:
         """
         Files the quizzes and notes a finalized turn produced (REQ-13 / REQ-14).
@@ -442,7 +520,12 @@ class EchoSphereServer:
         if session is None:
             return {"notes": [], "quiz": None}
 
-        turn_id = stable_entity_id("turn", session.session_id, speaker_id, text)
+        # REQ-15: the turn is persisted first, so a note's `source_turn_ids` still
+        # resolve to something after the conversation has ended.
+        turn, _ = self.artifacts.add_turn(
+            TranscriptTurn.create(session.session_id, speaker_id, text, language)
+        )
+        turn_id = turn.id
 
         try:
             notes = self.artifact_generator.generate_notes(turn_result, session, [turn_id])
@@ -592,6 +675,45 @@ app = Flask(
 server_instance = EchoSphereServer(engine=os.getenv("ECHOSPHERE_ENGINE", "mock"))
 
 
+def log_llm_bridge_status() -> None:
+    """
+    Reports the Custom LLM bridge's reachability once, shortly after startup.
+
+    A broken tunnel is then visible in the first lines of the log rather than after a
+    failed conversation - the incident this exists to prevent presented as an agent that
+    joined, reported RUNNING, and said nothing, with no server-side signal at all.
+    """
+    if not server_instance.convoai.is_live_mode():
+        return
+
+    check = server_instance.convoai.check_llm_bridge()
+    if check.reachable:
+        logger.info("Custom LLM bridge reachable at %s.", check.url)
+        return
+
+    logger.error(
+        "Custom LLM bridge NOT reachable. %s",
+        server_instance.convoai.describe_bridge_problem(check)
+    )
+
+
+def schedule_llm_bridge_check(delay_seconds: float = BRIDGE_BOOT_CHECK_DELAY_SECONDS) -> None:
+    """
+    Runs the boot-time bridge check once the server is actually accepting connections.
+
+    Deliberately deferred rather than run inline at import: the bridge URL normally
+    points at a tunnel that forwards *to this process*, so probing it before the socket
+    is listening reports a 502 every single start. A check that cries wolf on every boot
+    is worse than no check - it trains the reader to skip the line that matters.
+    """
+    timer = threading.Timer(delay_seconds, log_llm_bridge_status)
+    timer.daemon = True
+    timer.start()
+
+
+schedule_llm_bridge_check()
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """
@@ -632,6 +754,10 @@ def api_start_session():
             "supported_modes": SessionMode.values()
         }), 400
 
+    # REQ-15: register the session with the artifact store now, so what it produces is
+    # retrievable by session id after the channel has moved on.
+    server_instance.artifacts.save_session(session)
+
     success = server_instance.start_session()
     return jsonify({
         "success": success,
@@ -650,6 +776,9 @@ def api_stop_session():
     channel = data.get("channel", server_instance.channel_name)
 
     closed = server_instance.sessions.end_session(channel)
+    if closed is not None:
+        # Stamp `ended_at` on the stored artifact; the artifact outlives the session.
+        server_instance.artifacts.save_session(closed)
     success = server_instance.stop_session()
     return jsonify({
         "success": success,
@@ -748,6 +877,40 @@ def api_rtc_token():
 # ------------------------------------------------------------------------------
 # Convo AI: Direct Spoken Conversation With The AI Co-Teacher (REQ-09 / REQ-10)
 # ------------------------------------------------------------------------------
+def _preflight_llm_bridge():
+    """
+    Refuses a live agent start when the Convo AI Engine could not call this backend.
+
+    Returns a `(response, 502)` tuple to return to the client, or None to proceed.
+
+    Skipped entirely in simulated mode - without Agora credentials no Engine will ever
+    call the bridge, so its reachability is irrelevant and blocking the offline demo over
+    it would be a fault rather than a safeguard. `CONVOAI_SKIP_BRIDGE_PREFLIGHT=1` is the
+    documented escape hatch for deliberately starting an agent against a dead bridge.
+    """
+    if not server_instance.convoai.is_live_mode():
+        return None
+
+    if os.getenv("CONVOAI_SKIP_BRIDGE_PREFLIGHT", "").strip() in ("1", "true", "True"):
+        logger.warning(
+            "CONVOAI_SKIP_BRIDGE_PREFLIGHT is set: starting the agent without verifying "
+            "that the Custom LLM bridge is reachable."
+        )
+        return None
+
+    check = server_instance.convoai.check_llm_bridge()
+    if check.reachable:
+        return None
+
+    message = server_instance.convoai.describe_bridge_problem(check)
+    logger.error("Refusing to start a Convo AI agent. %s", message)
+    return jsonify({
+        "success": False,
+        "error": message,
+        "bridge": check.to_dict()
+    }), 502
+
+
 @app.route("/api/convoai/start", methods=["POST"])
 def api_convoai_start():
     """
@@ -764,6 +927,13 @@ def api_convoai_start():
     # REQ-LLM-02 / REQ-LLM-05: this is the only point at which the learner's chosen
     # language is known, so capture it here for the Custom LLM bridge to read back, and
     # start the conversation from clean agent state.
+    # Preflight the Custom LLM bridge before anything else is spent (D-BR-1). An agent
+    # started against an unreachable bridge joins, reports RUNNING, and never speaks -
+    # the failure this backend used to produce with a completely clean log.
+    bridge_error = _preflight_llm_bridge()
+    if bridge_error:
+        return bridge_error
+
     # REQ-12: the mode is required here too, and creating the session is what registers
     # it. An unusable mode must fail before an agent is started, not after.
     try:
@@ -887,23 +1057,53 @@ def api_convoai_status():
     }), 200
 
 
+def _resolve_governed_session(require_artifact: bool = False):
+    """
+    Resolves the session an artifact request addresses and authorizes the caller.
+
+    Returns `(meta, artifact, None)` on success, or `(None, None, response)` carrying the
+    404/403 the endpoint should return. Every artifact endpoint goes through here so the
+    REQ-16 access check is structurally impossible to skip in one of them.
+    """
+    body = request.get_json(silent=True) or {}
+    meta = server_instance.resolve_artifact_session(
+        channel=request.args.get("channel") or body.get("channel"),
+        session_id=request.args.get("session_id") or body.get("session_id")
+    )
+    if meta is None:
+        return None, None, (jsonify({"success": False, "error": "No such session."}), 404)
+
+    try:
+        require_access(meta, resolve_actor(request))
+    except AccessDeniedError as exc:
+        return None, None, (jsonify({"success": False, "error": str(exc)}), 403)
+
+    artifact = server_instance.artifacts.build_artifact(meta["session_id"])
+    if require_artifact and artifact is None:
+        return None, None, (jsonify({
+            "success": False,
+            "session_id": meta["session_id"],
+            "error": "This session has produced no artifacts."
+        }), 404)
+
+    return meta, artifact, None
+
+
 @app.route("/api/session/notes", methods=["GET"])
 def api_session_notes():
     """
     Returns the notes captured for the session on a channel (REQ-14).
     """
-    channel = request.args.get("channel", server_instance.channel_name)
-    session = server_instance.sessions.get_session(channel)
-    if session is None:
-        return jsonify({"success": False, "channel": channel, "notes": [],
-                        "error": f"No active session on channel '{channel}'."}), 404
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
 
-    notes = server_instance.artifacts.list_notes(session.session_id)
+    notes = server_instance.artifacts.list_notes(meta["session_id"])
     return jsonify({
         "success": True,
-        "channel": channel,
-        "session_id": session.session_id,
-        "mode": session.mode.value,
+        "channel": meta.get("channel"),
+        "session_id": meta["session_id"],
+        "mode": meta.get("mode"),
         "notes": [note.to_dict() for note in notes]
     }), 200
 
@@ -916,18 +1116,140 @@ def api_delete_session_note(note_id: str):
     A missing note is a 404 rather than a success: a stale client deleting twice must not
     produce a second `note.deleted` event for a note nobody else still shows.
     """
-    channel = request.args.get("channel", server_instance.channel_name)
-    session = server_instance.sessions.get_session(channel)
-    if session is None:
-        return jsonify({"success": False, "channel": channel,
-                        "error": f"No active session on channel '{channel}'."}), 404
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
 
-    deleted = server_instance.artifact_generator.delete_note(note_id, session)
-    if deleted is None:
-        return jsonify({"success": False, "note_id": note_id,
-                        "error": "No such note."}), 404
+    stored = server_instance.artifacts.get_note(note_id)
+    if stored is None or stored.session_id != meta["session_id"]:
+        return jsonify({"success": False, "note_id": note_id, "error": "No such note."}), 404
 
+    deleted = server_instance.artifacts.delete_note(
+        note_id, actor=resolve_actor(request) or "user"
+    )
+    server_instance.announce_note_change(deleted, meta, event_type="note.deleted")
     return jsonify({"success": True, "note": deleted.to_dict()}), 200
+
+
+@app.route("/api/session/artifact", methods=["DELETE"])
+def api_delete_session_artifact():
+    """
+    Deletes everything a session produced - transcript, notes, and quizzes (REQ-16).
+
+    A hard delete, not a tombstone: the acceptance criterion is that the transcript
+    becomes unavailable too, and a retained transcript still holds everything that was
+    said no matter how the notes over it are flagged.
+    """
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    session_id = meta["session_id"]
+    deleted_entities = server_instance.artifacts.purge_session(session_id)
+    if meta.get("channel"):
+        server_instance.sessions.end_session(meta["channel"])
+
+    logger.info(
+        "Session %s deleted by %r: %d entities removed.",
+        session_id, resolve_actor(request), deleted_entities
+    )
+    return jsonify({
+        "success": True,
+        "session_id": session_id,
+        "deleted_entities": deleted_entities
+    }), 200
+
+
+@app.route("/api/session/artifact", methods=["GET"])
+def api_session_artifact():
+    """
+    Returns everything one session produced, as the versioned envelope (REQ-15).
+
+    Addressable by `channel` (the latest session on it) or by `session_id` - the second
+    form is what a client uses after the conversation ended and the channel moved on.
+    """
+    _, artifact, error = _resolve_governed_session(require_artifact=True)
+    if error:
+        return error
+
+    return jsonify({"success": True, "artifact": artifact.to_dict()}), 200
+
+
+@app.route("/api/session/artifact/export", methods=["GET"])
+def api_export_session_artifact():
+    """
+    Exports a session artifact (REQ-15).
+
+    `markdown` always works and is served inline. `notion` is optional and answers 503
+    when the server holds no Notion credentials - an unconfigured optional export must
+    say so rather than appear to have succeeded.
+    """
+    export_format = (request.args.get("format") or "markdown").strip().lower()
+    _, artifact, error = _resolve_governed_session(require_artifact=True)
+    if error:
+        return error
+
+    if export_format == "markdown":
+        return Response(
+            render_markdown(artifact),
+            mimetype="text/markdown",
+            headers={
+                "Content-Disposition":
+                    f'inline; filename="echosphere-{artifact.session_id}.md"'
+            }
+        )
+
+    if export_format == "notion":
+        try:
+            result = NotionExportAdapter().export(artifact)
+        except ExportNotConfiguredError as exc:
+            return jsonify({"success": False, "error": str(exc)}), 503
+        except Exception as exc:
+            logger.error("Notion export failed for %s: %s", artifact.session_id, exc)
+            return jsonify({"success": False, "error": str(exc)}), 502
+        return jsonify({"success": True, "notion": result}), 200
+
+    return jsonify({
+        "success": False,
+        "error": f"Unsupported export format {export_format!r}.",
+        "supported_formats": ["markdown", "notion"]
+    }), 400
+
+
+@app.route("/api/session/notes/<note_id>", methods=["PATCH"])
+def api_edit_session_note(note_id: str):
+    """
+    Edits one stored note, recording who changed it (REQ-15 / REQ-16).
+
+    Deliberately has no approval gate on the way in - the note was already persisted the
+    moment the turn finalized (REQ-15) - so this is a correction of stored content, not
+    an acceptance step. The edit pins the note against later regeneration.
+    """
+    data = request.get_json(silent=True) or {}
+    text = str(data.get("text", "")).strip()
+    if not text:
+        return jsonify({
+            "success": False,
+            "error": "An edit must supply non-empty 'text'."
+        }), 400
+
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    stored = server_instance.artifacts.get_note(note_id)
+    if stored is None or stored.session_id != meta["session_id"]:
+        return jsonify({"success": False, "note_id": note_id, "error": "No such note."}), 404
+
+    edited = server_instance.artifacts.edit_note(
+        note_id,
+        text=text,
+        owner=data.get("owner"),
+        due_at=data.get("due_at"),
+        actor=str(data.get("actor") or "user")
+    )
+    server_instance.announce_note_change(edited, meta)
+    return jsonify({"success": True, "note": edited.to_dict()}), 200
 
 
 @app.route("/api/session/quizzes", methods=["GET"])
@@ -935,18 +1257,16 @@ def api_session_quizzes():
     """
     Returns the quizzes generated for the session on a channel (REQ-13).
     """
-    channel = request.args.get("channel", server_instance.channel_name)
-    session = server_instance.sessions.get_session(channel)
-    if session is None:
-        return jsonify({"success": False, "channel": channel, "quizzes": [],
-                        "error": f"No active session on channel '{channel}'."}), 404
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
 
-    quizzes = server_instance.artifacts.list_quizzes(session.session_id)
+    quizzes = server_instance.artifacts.list_quizzes(meta["session_id"])
     return jsonify({
         "success": True,
-        "channel": channel,
-        "session_id": session.session_id,
-        "mode": session.mode.value,
+        "channel": meta.get("channel"),
+        "session_id": meta["session_id"],
+        "mode": meta.get("mode"),
         "quizzes": [quiz.to_dict() for quiz in quizzes]
     }), 200
 
