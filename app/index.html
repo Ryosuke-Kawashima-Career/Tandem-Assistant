@@ -192,6 +192,13 @@
               <span>📷 Camera Assist</span>
               <span id="camera-hint" style="font-size: 11px; color: var(--macos-text-secondary);">Type a question below to ask about it</span>
             </div>
+            <!-- D-UIUX-4: a machine can expose several front-facing cameras - a real
+                 webcam, a Windows Hello IR sensor, a virtual camera - and the browser
+                 picks among them on its own. The two decoys open cleanly and show
+                 nothing, so this offers the real labels and lets the choice be corrected.
+                 Hidden when the machine has only one camera. -->
+            <select class="macos-lang-select camera-device-select" id="camera-device"
+                    title="Which camera to show the AI co-teacher" hidden></select>
             <video id="camera-preview" class="camera-preview" autoplay muted playsinline></video>
             <button class="macos-action-btn primary" id="btn-capture" style="width: 100%; margin-top: 6px;">
               <span>✨</span>

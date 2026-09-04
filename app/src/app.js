@@ -31,6 +31,14 @@ import { ReferenceCard } from './components/ReferenceCard.js';
 // left open for an hour costs a few hundred cheap reads rather than thousands.
 const ARTIFACT_POLL_INTERVAL_MS = 5000;
 
+// Video-input labels that routinely answer getUserMedia successfully while showing
+// nothing (D-UIUX-4). An infrared Windows Hello sensor returns a near-black frame under
+// ordinary room light; a virtual camera returns black whenever the software behind it is
+// not producing frames. Both open cleanly, report a real frame size, and even yield a
+// plausible vision description - so nothing this app can measure distinguishes them from
+// a working camera. The device label is the only signal that does.
+const DECOY_CAMERA_PATTERN = /\b(ir|infrared|depth|virtual|mirametrix|obs|snap|droidcam)\b/i;
+
 class TandemApp {
   /**
    * Initialize Tandem Application.
@@ -81,6 +89,9 @@ class TandemApp {
     // taken on demand and uploaded as one frame, so nothing is recorded or held.
     this.cameraStream = null;
     this.isCameraOn = false;
+    // The camera actually being shown (D-UIUX-4). Remembered across open/close so a
+    // participant who had to correct the browser's choice only corrects it once.
+    this.cameraDeviceId = null;
 
     // Session timer (REQ-23). Client-side and approximate on purpose: it is a motivation
     // cue, and the authoritative duration is the stored session's own timestamps.
@@ -313,7 +324,7 @@ class TandemApp {
     if (!query || !query.trim()) return;
 
     try {
-      await requestJson('/api/tools/search', {
+      const body = await requestJson('/api/tools/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -322,9 +333,17 @@ class TandemApp {
           query: query.trim()
         })
       });
+      // The card also arrives over the RTC data stream, but that transport is not
+      // real yet (D-UIUX-2) - rendering the REST response directly, the same way
+      // captureCameraFrame() already does for vision, is what makes a lookup that
+      // clearly succeeded on the server actually show up on screen.
+      this.referenceCard.renderReference({ card: body?.card });
     } catch (err) {
-      // The card, or the reason there is none, arrives over the data stream; this only
-      // catches a transport failure, which the stream cannot report.
+      this.referenceCard.renderStatus({
+        tool: 'search',
+        state: err.status === 503 ? 'unavailable' : 'failed',
+        reason: err.message
+      });
       console.warn('🔎 Reference lookup failed:', err.message);
     }
   }
@@ -439,9 +458,6 @@ class TandemApp {
    * something, and a preview left running is a camera nobody remembers is on.
    */
   async toggleCamera() {
-    const panel = document.getElementById('camera-panel');
-    const video = document.getElementById('camera-preview');
-
     if (this.isCameraOn) {
       this.stopCamera();
       return;
@@ -456,10 +472,7 @@ class TandemApp {
     }
 
     try {
-      this.cameraStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 1280 } },
-        audio: false
-      });
+      this.cameraStream = await this.openCameraStream(this.cameraDeviceId);
     } catch (err) {
       this.referenceCard.renderStatus({
         tool: 'vision', state: 'unavailable',
@@ -468,13 +481,171 @@ class TandemApp {
       return;
     }
 
+    // Correct one specific silent failure before anything is shown: a facing-mode
+    // preference can be satisfied by any front-facing device, and on a machine carrying
+    // an IR sensor or a virtual camera beside the real webcam, that choice can land on
+    // one that shows nothing. Skipped once the participant has picked a camera
+    // themselves - their choice outranks this guess.
+    if (!this.cameraDeviceId) {
+      const better = await this.findVisibleLightCamera();
+      if (better) {
+        this.releaseCameraStream();
+        try {
+          this.cameraStream = await this.openCameraStream(better.deviceId);
+          this.cameraDeviceId = better.deviceId;
+          console.log(`📷 Using '${better.label}': the camera first offered shows no visible-light image.`);
+        } catch (err) {
+          // Reopening failed, so fall back to the browser's own pick: a preview the
+          // participant can correct with the picker beats no preview at all.
+          console.warn('📷 Could not switch camera:', err.message);
+          this.cameraStream = await this.openCameraStream(null).catch(() => null);
+        }
+      }
+    }
+
+    if (!this.cameraStream) {
+      this.referenceCard.renderStatus({
+        tool: 'vision', state: 'unavailable',
+        reason: 'No camera could be opened on this machine.'
+      });
+      return;
+    }
+
+    await this.showCameraStream();
+    this.isCameraOn = true;
+    await this.populateCameraDevices();
+    this.updateCameraUi();
+  }
+
+  /**
+   * Opens a camera stream: a named device, or the browser's own choice.
+   *
+   * `facingMode: 'user'` rather than `'environment'` - this is a laptop client, and the
+   * feature is holding a page or a whiteboard up to the built-in webcam, not a phone's
+   * rear camera. It is only a preference either way; `deviceId` is what actually decides,
+   * which is why the caller supplies one as soon as it knows a good one.
+   *
+   * @param {string|null} deviceId - Exact device to open, or null to let the browser pick
+   * @returns {Promise<MediaStream>}
+   */
+  openCameraStream(deviceId = null) {
+    const video = deviceId
+      ? { deviceId: { exact: deviceId }, width: { ideal: 1280 } }
+      : { facingMode: 'user', width: { ideal: 1280 } };
+    return navigator.mediaDevices.getUserMedia({ video, audio: false });
+  }
+
+  /**
+   * Names a real visible-light camera to switch to, when the open one is not one.
+   *
+   * Device labels are blank until a camera permission has been granted, which is why this
+   * runs after the first stream opens rather than instead of it.
+   *
+   * @returns {Promise<Object|null>} A better `MediaDeviceInfo`, or null to keep this one
+   */
+  async findVisibleLightCamera() {
+    const track = this.cameraStream?.getVideoTracks?.()[0];
+    if (!track || !DECOY_CAMERA_PATTERN.test(track.label || '')) return null;
+
+    const activeId = track.getSettings?.().deviceId || '';
+    const devices = await this.listVideoInputs();
+    return devices.find((device) => (
+      device.deviceId
+      && device.deviceId !== activeId
+      && !DECOY_CAMERA_PATTERN.test(device.label || '')
+    )) || null;
+  }
+
+  /**
+   * Lists the video inputs this browser will admit to, or an empty list.
+   */
+  async listVideoInputs() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      return devices.filter((device) => device.kind === 'videoinput');
+    } catch (err) {
+      console.warn('📷 Could not enumerate cameras:', err.message);
+      return [];
+    }
+  }
+
+  /**
+   * Fills the camera picker with the real device labels (D-UIUX-4).
+   *
+   * Shown only when there is a choice to make: on a one-camera machine this would be a
+   * dropdown with a single entry, which says nothing and takes up room. Options are built
+   * as DOM nodes rather than markup - a device label is operating-system text, and there
+   * is no reason to interpolate text into HTML when a node will do.
+   */
+  async populateCameraDevices() {
+    const select = document.getElementById('camera-device');
+    if (!select) return;
+
+    const devices = await this.listVideoInputs();
+    const activeId = this.cameraStream?.getVideoTracks?.()[0]?.getSettings?.().deviceId || '';
+
+    select.replaceChildren(...devices.map((device, index) => {
+      const option = document.createElement('option');
+      option.value = device.deviceId;
+      option.textContent = device.label || `Camera ${index + 1}`;
+      option.selected = device.deviceId === activeId;
+      return option;
+    }));
+    select.hidden = devices.length < 2;
+  }
+
+  /**
+   * Switches the preview to a camera the participant picked (D-UIUX-4).
+   *
+   * @param {string} deviceId - `deviceId` of the chosen video input
+   */
+  async selectCameraDevice(deviceId) {
+    if (!deviceId || !this.isCameraOn) return;
+
+    let stream;
+    try {
+      stream = await this.openCameraStream(deviceId);
+    } catch (err) {
+      this.referenceCard.renderStatus({
+        tool: 'vision', state: 'failed',
+        reason: `Could not switch to that camera: ${err.message}`
+      });
+      // Put the picker back on the camera actually being shown, so the control never
+      // claims a device that failed to open.
+      await this.populateCameraDevices();
+      return;
+    }
+
+    // The previous stream is released only once its replacement is open: stopping first
+    // blanks the preview for as long as the new device takes to start, and leaves it
+    // blank for good if it never does.
+    this.releaseCameraStream();
+    this.cameraStream = stream;
+    this.cameraDeviceId = deviceId;
+    await this.showCameraStream();
+  }
+
+  /**
+   * Plays the open stream in the preview and reveals the panel.
+   */
+  async showCameraStream() {
+    const panel = document.getElementById('camera-panel');
+    const video = document.getElementById('camera-preview');
+
     if (video) {
       video.srcObject = this.cameraStream;
       await video.play().catch(() => {});
     }
     if (panel) panel.classList.remove('hidden');
-    this.isCameraOn = true;
-    this.updateCameraUi();
+  }
+
+  /**
+   * Stops every track on the open stream and forgets it.
+   */
+  releaseCameraStream() {
+    if (!this.cameraStream) return;
+    this.cameraStream.getTracks().forEach((track) => track.stop());
+    this.cameraStream = null;
   }
 
   /**
@@ -484,10 +655,7 @@ class TandemApp {
     const panel = document.getElementById('camera-panel');
     const video = document.getElementById('camera-preview');
 
-    if (this.cameraStream) {
-      this.cameraStream.getTracks().forEach((track) => track.stop());
-      this.cameraStream = null;
-    }
+    this.releaseCameraStream();
     if (video) video.srcObject = null;
     if (panel) panel.classList.add('hidden');
     this.isCameraOn = false;
@@ -1031,6 +1199,15 @@ class TandemApp {
     const btnCamera = document.getElementById('btn-camera');
     if (btnCamera) {
       btnCamera.addEventListener('click', () => this.toggleCamera());
+    }
+
+    // D-UIUX-4: correcting the browser's camera choice, when it picked a device that
+    // opens cleanly and shows nothing.
+    const cameraDevice = document.getElementById('camera-device');
+    if (cameraDevice) {
+      cameraDevice.addEventListener('change', () => {
+        this.selectCameraDevice(cameraDevice.value);
+      });
     }
 
     const btnCapture = document.getElementById('btn-capture');
