@@ -39,7 +39,11 @@ load_dotenv(override=True)
 from src.rtc.agora_client import AgoraVoiceChannelClient, is_usable_credential
 from src.rtc.data_stream import DataStreamManager
 from src.artifacts.access import AccessDeniedError, require_access, resolve_actor
-from src.artifacts.adapters import ExportNotConfiguredError, NotionExportAdapter
+from src.artifacts.adapters import (
+    SUPPORTED_TARGETS as SUPPORTED_NOTION_TARGETS,
+    ExportNotConfiguredError,
+    NotionExportAdapter,
+)
 from src.artifacts.export import render_markdown
 from src.artifacts.generator import ArtifactGenerator
 from src.artifacts.models import TranscriptTurn
@@ -53,6 +57,8 @@ from src.rtc.convoai_client import (
     AGENT_STATUS_RECOVERING,
 )
 from src.agent.orchestrator import TeachingAgent
+from src.agent.tools.base import ToolState
+from src.agent.tools.dispatch import ToolDispatcher
 from src.audio.vad_processor import VoiceActivityDetector
 from src.audio.stt_transcriber import STTTranscriber
 from src.audio.tts_synthesizer import TTSSynthesizer
@@ -120,8 +126,12 @@ class EchoSphereServer:
         self.rtc_client = AgoraVoiceChannelClient(channel_name=channel_name)
         self.data_stream = DataStreamManager(self.rtc_client)
 
-        # Step 3: AI and Audio Pipeline
-        self.agent = TeachingAgent(engine=engine)
+        # Step 3: AI and Audio Pipeline. The agent's external tools (REQ-18-20) are built
+        # here rather than inside the agent so they publish over this server's own data
+        # stream; each one is unconfigured - and reports itself so - until its credentials
+        # are present in the environment.
+        self.tools = ToolDispatcher.from_env(data_stream=self.data_stream)
+        self.agent = TeachingAgent(engine=engine, tools=self.tools)
         self.vad = VoiceActivityDetector()
         self.stt = STTTranscriber(engine=engine)
         self.tts = TTSSynthesizer()
@@ -321,13 +331,7 @@ class EchoSphereServer:
             return False
 
         try:
-            session = SessionRecord(
-                session_id=meta["session_id"],
-                mode=SessionMode.parse(meta.get("mode") or SessionMode.LANGUAGE_LEARNING),
-                channel=meta.get("channel") or "",
-                languages=list(meta.get("languages") or []),
-                participants=list(meta.get("participants") or [])
-            )
+            session = _session_from_meta(meta)
             return self.artifact_generator._emit(
                 event_type, session, "note", note.to_dict(), note.revision
             )
@@ -609,7 +613,29 @@ class EchoSphereServer:
             )
             return {"notes": [], "quiz": None}
 
+        self.research_turn(turn_result, session)
         return {"notes": notes, "quiz": quiz}
+
+    def research_turn(self, turn_result: Dict[str, Any], session: SessionRecord) -> None:
+        """
+        Looks up a point this turn left uncertain, if there is one (REQ-18).
+
+        Dispatched asynchronously even here: this method already runs off the voice path,
+        but the vendor call is the slowest thing in the turn's tail, and holding notes and
+        quizzes behind a search would put a working feature behind an optional one. The
+        future is retained on the scaffolding list so diagnostics can join it.
+        """
+        query = self.agent.resolve_research_query(turn_result, session)
+        if not query:
+            return
+
+        logger.info(
+            "Turn in session %s left %r uncertain; researching it.",
+            session.session_id, query
+        )
+        self._scaffolding_futures.append(
+            self.tools.search_reference_async(session, query, requested_by="assistant")
+        )
 
     def log_convoai_agent_health(self, channel: str) -> Optional[Dict[str, Any]]:
         """
@@ -1247,6 +1273,24 @@ def api_convoai_status():
     }), 200
 
 
+def _session_from_meta(meta: Dict[str, Any]) -> SessionRecord:
+    """
+    Rebuilds a session record from the metadata the artifact store kept.
+
+    An artifact request can arrive after the session ended and its registry entry is
+    gone, so the record every downstream collaborator expects - the artifact generator's
+    events, the tool dispatcher's envelopes - is reconstructed from what was persisted
+    rather than looked up in a registry that no longer holds it.
+    """
+    return SessionRecord(
+        session_id=meta["session_id"],
+        mode=SessionMode.parse(meta.get("mode") or SessionMode.LANGUAGE_LEARNING),
+        channel=meta.get("channel") or "",
+        languages=list(meta.get("languages") or []),
+        participants=list(meta.get("participants") or [])
+    )
+
+
 def _resolve_governed_session(require_artifact: bool = False):
     """
     Resolves the session an artifact request addresses and authorizes the caller.
@@ -1372,9 +1416,19 @@ def api_export_session_artifact():
 
     `markdown` always works and is served inline. `notion` is optional and answers 503
     when the server holds no Notion credentials - an unconfigured optional export must
-    say so rather than appear to have succeeded.
+    say so rather than appear to have succeeded. `target=page|database` selects which
+    Notion destination to write to (TASK-12.5); omitted, the adapter uses whichever one
+    this server has configured.
     """
     export_format = (request.args.get("format") or "markdown").strip().lower()
+    target = (request.args.get("target") or "").strip().lower() or None
+    if target is not None and target not in SUPPORTED_NOTION_TARGETS:
+        return jsonify({
+            "success": False,
+            "error": f"Unsupported Notion export target {target!r}.",
+            "supported_targets": list(SUPPORTED_NOTION_TARGETS)
+        }), 400
+
     _, artifact, error = _resolve_governed_session(require_artifact=True)
     if error:
         return error
@@ -1391,7 +1445,7 @@ def api_export_session_artifact():
 
     if export_format == "notion":
         try:
-            result = NotionExportAdapter().export(artifact)
+            result = NotionExportAdapter().export(artifact, target=target)
         except ExportNotConfiguredError as exc:
             return jsonify({"success": False, "error": str(exc)}), 503
         except Exception as exc:
@@ -1459,6 +1513,117 @@ def api_session_quizzes():
         "mode": meta.get("mode"),
         "quizzes": [quiz.to_dict() for quiz in quizzes]
     }), 200
+
+
+# ------------------------------------------------------------------------------
+# Agent tools: Google Search, Anki MCP, Google Calendar (REQ-18 / REQ-19 / REQ-20)
+# ------------------------------------------------------------------------------
+# Status codes follow the Notion export's precedent: an unconfigured optional integration
+# answers 503 and a failed call answers 502, so a client can tell "this server never had
+# that tool" from "that tool is having a bad day" - and neither ever looks like success.
+TOOL_STATUS_CODES = {ToolState.OK: 200, ToolState.UNAVAILABLE: 503, ToolState.FAILED: 502}
+
+
+def _tool_response(result, key: str, extra: Optional[Dict[str, Any]] = None):
+    """Renders one `ToolResult` as this API's JSON response."""
+    body: Dict[str, Any] = {
+        "success": result.ok,
+        "tool": result.tool,
+        "state": result.state,
+        key: result.payload,
+    }
+    if result.reason:
+        body["error"] = result.reason
+    body.update(extra or {})
+    return jsonify(body), TOOL_STATUS_CODES.get(result.state, 502)
+
+
+@app.route("/api/tools/status", methods=["GET"])
+def api_tools_status():
+    """
+    Reports which agent tools this server can run (REQ-18-20).
+
+    The frontend needs this to avoid offering a control whose only possible outcome is a
+    503; it deliberately carries no credential material, only a boolean per tool.
+    """
+    return jsonify({"success": True, "tools": server_instance.tools.status()}), 200
+
+
+@app.route("/api/tools/search", methods=["POST"])
+def api_tools_search():
+    """
+    Looks up reference or task material for a session and publishes the card (REQ-18).
+    """
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    body = request.get_json(silent=True) or {}
+    query = (body.get("query") or "").strip()
+    if not query:
+        return jsonify({"success": False, "error": "A lookup needs a `query`."}), 400
+
+    materials = body.get("materials")
+    result = server_instance.tools.search_reference(
+        _session_from_meta(meta),
+        query,
+        materials=None if materials is None else bool(materials),
+        requested_by=resolve_actor(request) or ""
+    )
+    return _tool_response(result, "card", {"session_id": meta["session_id"]})
+
+
+@app.route("/api/tools/anki/export", methods=["POST"])
+def api_tools_anki_export():
+    """
+    Exports a session's vocabulary and terminology to Anki (REQ-19).
+
+    Governed like every other artifact endpoint: the cards carry what was said, so
+    sending them to a stranger's collection is the same disclosure as the transcript.
+    """
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    body = request.get_json(silent=True) or {}
+    notes = server_instance.artifacts.list_notes(meta["session_id"])
+    result = server_instance.tools.export_vocabulary(
+        _session_from_meta(meta), notes, deck=(body.get("deck") or None)
+    )
+    return _tool_response(result, "export", {"session_id": meta["session_id"]})
+
+
+@app.route("/api/tools/calendar/schedule", methods=["POST"])
+def api_tools_schedule_meeting():
+    """
+    Books a follow-up meeting for a session and invites its attendees (REQ-20).
+
+    Attendee addresses travel in the request rather than being read from the session:
+    a `SessionRecord` records participants by display name, and this system has no
+    registry mapping those to email addresses yet (see the plan's TASK-12.4 note).
+    """
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    body = request.get_json(silent=True) or {}
+    start_time = body.get("start_time")
+    if not start_time:
+        return jsonify({
+            "success": False,
+            "error": "A meeting needs a `start_time` (ISO-8601, e.g. 2026-09-10T09:00:00Z)."
+        }), 400
+
+    result = server_instance.tools.schedule_meeting(
+        _session_from_meta(meta),
+        summary=(body.get("summary") or ""),
+        start_time=start_time,
+        duration_minutes=int(body.get("duration_minutes") or 30),
+        attendees=body.get("attendees") or [],
+        description=(body.get("description") or ""),
+        requested_by=resolve_actor(request) or ""
+    )
+    return _tool_response(result, "meeting", {"session_id": meta["session_id"]})
 
 
 def _split_for_streaming(text: str, size: int = SSE_CHUNK_CHARS) -> List[str]:

@@ -24,6 +24,7 @@ import { TopicWidget } from './components/TopicWidget.js';
 import { TeacherBar } from './components/TeacherBar.js';
 import { QuizWidget } from './components/QuizWidget.js';
 import { NotesPanel } from './components/NotesPanel.js';
+import { ReferenceCard } from './components/ReferenceCard.js';
 
 class TandemApp {
   /**
@@ -79,6 +80,13 @@ class TandemApp {
     // Step 2: Initialize UI Components
     this.subtitles = new Subtitles('#subtitles-container');
     this.idiomCard = new IdiomCard('#scaffolding-container');
+    // Agent tools (REQ-18-20): reference/material cards, meeting receipts, and the
+    // notice an unavailable tool leaves. Shares the scaffolding column, because all of
+    // it answers the same question - what did the assistant just produce.
+    this.referenceCard = new ReferenceCard('#scaffolding-container');
+    // Which tools this server actually holds credentials for, so a control is not
+    // offered when its only possible outcome is a 503.
+    this.availableTools = {};
     this.quizWidget = new QuizWidget('#scaffolding-container');
     this.notesPanel = new NotesPanel('#notes-container', {
       emptyHint: '#notes-empty-hint',
@@ -108,6 +116,7 @@ class TandemApp {
     this.bindDomEvents();
     this.setupTeacherBarActions();
     this.checkBackendConnection();
+    this.refreshToolAvailability();
 
     console.log('🚀 EchoSphere Tandem Client initialized with macOS Light Theme.');
   }
@@ -196,6 +205,141 @@ class TandemApp {
     this.streamManager.on('translation.output_transcript', (payload) => {
       this.handleTranslationTranscript(payload);
     });
+
+    // Agent tools (REQ-18-20). Enveloped like the artifact events:
+    // {schema_version, event_id, session_id, mode, tool, card|export|meeting}.
+    this.streamManager.on('reference.card', (payload) => {
+      this.referenceCard.renderReference(payload);
+    });
+
+    this.streamManager.on('meeting.scheduled', (payload) => {
+      this.referenceCard.renderMeeting(payload);
+    });
+
+    this.streamManager.on('anki.exported', (payload) => {
+      this.referenceCard.renderExport(payload);
+    });
+
+    this.streamManager.on('tool.status', (payload) => {
+      this.referenceCard.renderStatus(payload);
+    });
+  }
+
+  /**
+   * Asks the backend which agent tools it can actually run (REQ-18-20).
+   *
+   * A control whose tool has no credentials is disabled rather than hidden: the feature
+   * exists, this deployment just has not configured it, and a disabled button with a
+   * tooltip says that where a missing one says nothing.
+   */
+  async refreshToolAvailability() {
+    try {
+      const body = await requestJson('/api/tools/status');
+      this.availableTools = body?.tools || {};
+    } catch (err) {
+      console.log('ℹ️ Agent tool status unavailable:', err.message);
+      this.availableTools = {};
+    }
+    this.updateToolControls();
+  }
+
+  /**
+   * Enables or disables each agent-tool control from the reported availability.
+   */
+  updateToolControls() {
+    const controls = [
+      ['btn-research', 'search', 'Google Search is not configured on this server.'],
+      ['btn-anki', 'anki', 'No Anki MCP server is configured on this server.'],
+      ['btn-schedule', 'calendar', 'Google Calendar is not configured on this server.'],
+    ];
+
+    controls.forEach(([id, tool, unavailableHint]) => {
+      const btn = document.getElementById(id);
+      if (!btn) return;
+      const available = Boolean(this.availableTools?.[tool]);
+      btn.disabled = !available;
+      if (!available) btn.title = unavailableHint;
+    });
+  }
+
+  /**
+   * Researches a topic for the current session and publishes the card (REQ-18).
+   *
+   * The query is asked for rather than inferred: a participant pressing "Research" has
+   * something specific in mind, and guessing it from the last subtitle produces a card
+   * about whatever happened to be said most recently.
+   */
+  async researchTopic() {
+    const query = window.prompt('What should the AI co-teacher look up?');
+    if (!query || !query.trim()) return;
+
+    try {
+      await requestJson('/api/tools/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel: this.channelName,
+          actor: this.speakerId,
+          query: query.trim()
+        })
+      });
+    } catch (err) {
+      // The card, or the reason there is none, arrives over the data stream; this only
+      // catches a transport failure, which the stream cannot report.
+      console.warn('🔎 Reference lookup failed:', err.message);
+    }
+  }
+
+  /**
+   * Exports this session's vocabulary and terminology to Anki (REQ-19).
+   */
+  async exportToAnki() {
+    try {
+      const body = await requestJson('/api/tools/anki/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel: this.channelName, actor: this.speakerId })
+      });
+      console.log('🗂️ Anki export:', body);
+    } catch (err) {
+      console.warn('🗂️ Anki export failed:', err.message);
+    }
+  }
+
+  /**
+   * Books a follow-up meeting for this session (REQ-20).
+   *
+   * Attendee addresses are collected here because a session records participants by
+   * display name; this deployment has no registry mapping those to email addresses.
+   */
+  async scheduleFollowUp() {
+    const startTime = window.prompt(
+      'Start time for the follow-up (ISO-8601, e.g. 2026-09-10T09:00:00Z):'
+    );
+    if (!startTime || !startTime.trim()) return;
+
+    const attendeeList = window.prompt('Attendee email addresses (comma separated):') || '';
+    const attendees = attendeeList
+      .split(',')
+      .map((address) => address.trim())
+      .filter(Boolean);
+
+    try {
+      const body = await requestJson('/api/tools/calendar/schedule', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel: this.channelName,
+          actor: this.speakerId,
+          start_time: startTime.trim(),
+          duration_minutes: 30,
+          attendees
+        })
+      });
+      console.log('📅 Meeting scheduled:', body);
+    } catch (err) {
+      console.warn('📅 Scheduling failed:', err.message);
+    }
   }
 
   /**
@@ -476,6 +620,23 @@ class TandemApp {
     const btnExport = document.getElementById('btn-export');
     if (btnExport) {
       btnExport.addEventListener('click', () => this.exportSession());
+    }
+
+    // Agent tools (REQ-18-20). Each control is disabled until /api/tools/status says the
+    // server holds credentials for it, so a click cannot produce a bare 503.
+    const btnResearch = document.getElementById('btn-research');
+    if (btnResearch) {
+      btnResearch.addEventListener('click', () => this.researchTopic());
+    }
+
+    const btnAnki = document.getElementById('btn-anki');
+    if (btnAnki) {
+      btnAnki.addEventListener('click', () => this.exportToAnki());
+    }
+
+    const btnSchedule = document.getElementById('btn-schedule');
+    if (btnSchedule) {
+      btnSchedule.addEventListener('click', () => this.scheduleFollowUp());
     }
 
     // Join Channel Button

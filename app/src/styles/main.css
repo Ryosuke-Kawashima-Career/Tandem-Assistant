@@ -776,6 +776,47 @@ body {
   line-height: 1.4;
 }
 
+/* --------------------------------------------------------------------------
+   Agent tool cards (REQ-18-20): research results, meeting receipts, and the
+   notice an unavailable tool leaves. They reuse the idiom bubble's surface so
+   the scaffolding column reads as one stack rather than three widgets, and add
+   only what a result list needs: a rule between results and a thumbnail size.
+   -------------------------------------------------------------------------- */
+.reference-bubble .idiom-badge {
+  background: rgba(0, 122, 255, 0.12);
+  color: var(--macos-accent-blue);
+}
+
+.reference-result {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--macos-border-subtle);
+}
+
+.reference-result:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.reference-result a {
+  color: var(--macos-accent-blue);
+  text-decoration: none;
+}
+
+.reference-result a:hover {
+  text-decoration: underline;
+}
+
+.reference-thumb {
+  width: 100%;
+  max-height: 140px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--macos-border-subtle);
+}
+
 /* ==========================================================================
    9. Interactive Quiz Widget
    ========================================================================== */

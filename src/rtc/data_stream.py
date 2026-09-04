@@ -195,6 +195,21 @@ class DataStreamManager:
         """
         return self._dispatch(event_type, payload)
 
+    def send_tool_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
+        """
+        Broadcasts an agent tool event (REQ-18–20): `tool.status`, `reference.card`,
+        `anki.exported`, `meeting.scheduled`.
+
+        Algorithm:
+        1. Accept an already-enveloped payload (schema version, session, mode, tool).
+        2. Forward it unchanged to _dispatch under the given event type.
+
+        Enveloped by `ToolDispatcher` rather than here, for the same reason artifact and
+        translation events are: only the dispatcher knows which session and which tool
+        produced the outcome, and those are what a receiver files and deduplicates by.
+        """
+        return self._dispatch(event_type, payload)
+
     def send_speaking_balance(self, speaker_stats: Dict[str, int]) -> bool:
         """
         Broadcasts real-time speaking time percentage metrics to the classroom UI.

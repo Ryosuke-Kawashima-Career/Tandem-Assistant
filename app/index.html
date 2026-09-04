@@ -73,6 +73,29 @@
 
         <div style="width: 1px; height: 18px; background: var(--macos-border-subtle); margin: 0 4px;"></div>
 
+        <!-- REQ-18 / REQ-19 / REQ-20: the agent's external tools. Each stays disabled
+             until /api/tools/status reports credentials for it, so an unconfigured
+             deployment shows the feature without offering a button that only 503s. -->
+        <button class="macos-action-btn" id="btn-research" disabled
+                title="Look up a word, a cultural reference, or a task material">
+          <span>🔎</span>
+          <span>Research</span>
+        </button>
+
+        <button class="macos-action-btn" id="btn-anki" disabled
+                title="Export this session's vocabulary to Anki for spaced repetition">
+          <span>🗂️</span>
+          <span>Export to Anki</span>
+        </button>
+
+        <button class="macos-action-btn" id="btn-schedule" disabled
+                title="Book a follow-up session and invite the participants">
+          <span>📅</span>
+          <span>Schedule Follow-up</span>
+        </button>
+
+        <div style="width: 1px; height: 18px; background: var(--macos-border-subtle); margin: 0 4px;"></div>
+
         <button class="macos-action-btn" id="btn-simulation" title="Run realistic tri-lingual dialogue simulation">
           <span>✨</span>
           <span>Simulate Tandem Dialogue</span>

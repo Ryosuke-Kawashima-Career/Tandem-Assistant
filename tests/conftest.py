@@ -58,3 +58,25 @@ os.environ["ECHOSPHERE_ARTIFACT_RETENTION_DAYS"] = ""
 os.environ["ECHOSPHERE_ENGINE"] = "mock"
 os.environ["OPENAI_API_KEY"] = ""
 os.environ["GEMINI_API_KEY"] = ""
+
+# Agent tool credentials (REQ-18-20), blanked for the same reason as the provider keys
+# above: `ToolDispatcher.from_env()` reads the real process environment, so a shell that
+# has exported any of these would have the suite reach a live vendor - billing a search,
+# writing cards into somebody's real Anki collection, or creating a calendar event and
+# emailing invitations to whoever the test data names. Tests that exercise a configured
+# tool inject it explicitly, which is unaffected by these defaults.
+for _tool_variable in (
+    "GOOGLE_SEARCH_API_KEY",
+    "GOOGLE_SEARCH_CSE_ID",
+    "GOOGLE_CALENDAR_ACCESS_TOKEN",
+    "GOOGLE_CALENDAR_CREDENTIALS_JSON",
+    "ANKI_MCP_URL",
+    "ANKI_MCP_API_KEY",
+    "RESEND_API_KEY",
+    "RESEND_FROM_EMAIL",
+    "REPORT_EMAIL",
+    "NOTION_API_KEY",
+    "NOTION_PARENT_PAGE_ID",
+    "NOTION_DATABASE_ID",
+):
+    os.environ[_tool_variable] = ""

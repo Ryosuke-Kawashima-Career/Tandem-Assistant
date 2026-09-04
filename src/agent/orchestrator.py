@@ -30,6 +30,7 @@ from src.agent.prompts import (
     create_work_voice_prompt,
     create_silence_breaker_prompt
 )
+from src.agent.tools.dispatch import ToolDispatcher
 from src.sessions.models import SessionMode
 
 logger = logging.getLogger("echosphere.agent.orchestrator")
@@ -55,6 +56,27 @@ DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 # text, not for emitting a 5-block JSON schema without drift.
 DEFAULT_OPENAI_SCAFFOLDING_MODEL = "gpt-5.4"
 DEFAULT_GEMINI_SCAFFOLDING_MODEL = "gemini-3.5-flash"
+
+# Below this, a scaffolding point counts as something the model was not sure about, and
+# is worth looking up rather than asserting (REQ-18, agent-initiated research).
+#
+# Deliberately the same bar REQ-14 holds a note at `needs_confirmation`: the two
+# questions - "should this be shown as unconfirmed?" and "should this be checked?" - are
+# the same judgement about the same sentence, and answering them differently would put
+# a note on screen as uncertain while researching nothing about it.
+RESEARCH_CONFIDENCE_THRESHOLD = 0.6
+
+# Note types a lookup can actually answer. An action item or a decision is a commitment
+# somebody made in the room; searching the web for it returns somebody else's.
+RESEARCHABLE_NOTE_TYPES = ("vocabulary", "culture", "term", "glossary")
+
+# Separators between a term and its meaning, matching the note generator's own wording.
+# A query is the term, not the whole explanatory sentence around it.
+RESEARCH_SEPARATORS = (" — ", " – ", " - ", ": ")
+
+# Long enough for a phrase and its context, short enough that a runaway model sentence
+# does not become the search query.
+MAX_RESEARCH_QUERY_CHARS = 120
 
 # Human-readable names for the language codes the tutor path carries (REQ-LLM-02). The
 # Convo AI session language arrives as an ISO code, but the prompts name the language in
@@ -94,7 +116,8 @@ class TeachingAgent:
         target_language: str = "Japanese",
         native_language: str = "English",
         primary_language: str = "English",
-        peer_target_languages: Optional[Dict[str, str]] = None
+        peer_target_languages: Optional[Dict[str, str]] = None,
+        tools: Optional[ToolDispatcher] = None
     ):
         """
         Initialize the TeachingAgent with configuration and client credentials.
@@ -166,6 +189,12 @@ class TeachingAgent:
         # Step 3: Initialize State Buffers
         self.turn_history: List[Dict[str, str]] = []
         self.speaker_durations_ms: Dict[str, int] = {}
+
+        # Step 4: External tools (REQ-18-20). Injected by the server so tool events reach
+        # the live RTC data stream; the default dispatcher holds no tools at all, which is
+        # exactly how an agent constructed for a unit test or an offline run behaves -
+        # every tool call reports `unavailable` instead of reaching a vendor.
+        self.tools = tools if tools is not None else ToolDispatcher()
 
         logger.info(f"TeachingAgent initialized with engine: '{self.engine}' (Target: {self.target_language}, Native: {self.native_language})")
 
@@ -406,6 +435,56 @@ class TeachingAgent:
             if lang and lang not in seen:
                 seen.append(lang)
         return seen
+
+    def resolve_research_query(
+        self,
+        turn_result: Dict[str, Any],
+        session: Any = None
+    ) -> Optional[str]:
+        """
+        Decides whether a turn is worth a reference lookup, and what to look up (REQ-18).
+
+        Algorithm:
+        1. An explicit `research_query` from the model wins - it asked outright.
+        2. Otherwise take the first term or cultural point the model itself flagged as
+           uncertain, and query the term rather than the sentence around it.
+        3. Return None when the model was confident, which is the common case.
+
+        Step 3 is the whole point of the gate: researching every noun would put a live
+        conversation on a search engine's budget and bury the one card that mattered
+        under four that did not. The trigger is the model's own uncertainty (REQ-18:
+        "lacks a confident answer"), not the presence of a foreign word.
+        """
+        if not isinstance(turn_result, dict):
+            return None
+
+        explicit = str(turn_result.get("research_query") or "").strip()
+        if explicit:
+            return explicit[:MAX_RESEARCH_QUERY_CHARS]
+
+        for note in turn_result.get("notes") or []:
+            if not isinstance(note, dict):
+                continue
+            if str(note.get("type", "")).strip().lower() not in RESEARCHABLE_NOTE_TYPES:
+                continue
+
+            try:
+                confidence = float(note.get("confidence", 1.0))
+            except (TypeError, ValueError):
+                confidence = 1.0
+            if confidence >= RESEARCH_CONFIDENCE_THRESHOLD:
+                continue
+
+            text = str(note.get("text", "")).strip()
+            if not text:
+                continue
+            for separator in RESEARCH_SEPARATORS:
+                if separator in text:
+                    text = text.split(separator, 1)[0].strip()
+                    break
+            return text[:MAX_RESEARCH_QUERY_CHARS]
+
+        return None
 
     def process_turn(
         self,
