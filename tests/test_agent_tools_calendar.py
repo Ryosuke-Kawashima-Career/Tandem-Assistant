@@ -378,6 +378,10 @@ class TestToolStatusEndpoint(unittest.TestCase):
 
         The frontend needs a per-tool boolean to avoid offering a button that can only
         produce a 503; it has no business knowing the key behind it.
+
+        `vision` joined the set in spec 1.14.0 (REQ-22): camera assist is dispatched as a
+        fourth `agent/tools/` integration precisely so it inherits this availability
+        contract rather than inventing a second way to ask the same question.
         """
         response = self.app.get("/api/tools/status")
 
@@ -385,7 +389,7 @@ class TestToolStatusEndpoint(unittest.TestCase):
         body = response.get_json()
         self.assertTrue(body["success"])
         self.assertEqual(
-            set(body["tools"]), {"search", "anki", "calendar", "email"}
+            set(body["tools"]), {"search", "anki", "calendar", "email", "vision"}
         )
         for configured in body["tools"].values():
             self.assertIsInstance(configured, bool)

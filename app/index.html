@@ -29,6 +29,12 @@
           <span class="status-dot" id="connection-dot"></span>
           <span class="status-text" id="connection-status">SD-RTN™ Ready</span>
         </div>
+        <!-- REQ-23: session elapsed time. Client-side and approximate by design - it is a
+             motivation cue, not a governance record; REQ-16's stored started_at/ended_at
+             remain the only authoritative duration. -->
+        <span class="macos-badge-pill" id="session-timer" title="Time in this session">
+          ⏱️ 00:00
+        </span>
         <div class="convoai-status-pill hidden" id="convoai-status-pill">
           <span class="convoai-pulse-dot"></span>
           <span id="convoai-status-text">AI Co-Teacher Idle</span>
@@ -82,16 +88,18 @@
           <span>Research</span>
         </button>
 
-        <button class="macos-action-btn" id="btn-anki" disabled
-                title="Export this session's vocabulary to Anki for spaced repetition">
-          <span>🗂️</span>
-          <span>Export to Anki</span>
-        </button>
-
         <button class="macos-action-btn" id="btn-schedule" disabled
                 title="Book a follow-up session and invite the participants">
           <span>📅</span>
           <span>Schedule Follow-up</span>
+        </button>
+
+        <!-- REQ-22: camera assist. Explains one captured frame - a page, a whiteboard, a
+             handover document - rather than opening a video leg. -->
+        <button class="macos-action-btn" id="btn-camera" disabled aria-pressed="false"
+                title="Show the AI co-teacher what you are looking at">
+          <span id="btn-camera-icon">📷</span>
+          <span id="btn-camera-text">Camera Assist</span>
         </button>
 
         <div style="width: 1px; height: 18px; background: var(--macos-border-subtle); margin: 0 4px;"></div>
@@ -106,8 +114,21 @@
           <span>Clear Feed</span>
         </button>
 
-        <button class="macos-action-btn" id="btn-export" title="Open this session's stored notes and quizzes as Markdown">
-          <span>📄</span>
+        <!-- REQ-15 / REQ-19: one export control for every destination this session's
+             notes and quizzes can reach. Anki used to sit apart in the tools group,
+             where nobody looking for "export" found it. Its option is disabled when
+             /api/tools/status reports no Anki MCP server. -->
+        <select class="macos-lang-select" id="export-format"
+                title="Where to send this session's notes and quizzes">
+          <option value="markdown">📄 Markdown</option>
+          <option value="notion-page">📝 Notion page</option>
+          <option value="notion-database">🗃️ Notion database</option>
+          <option value="anki" id="export-option-anki" disabled>🗂️ Anki deck</option>
+        </select>
+
+        <button class="macos-action-btn" id="btn-export"
+                title="Export this session's stored notes and quizzes">
+          <span>📤</span>
           <span>Export Session</span>
         </button>
       </div>
@@ -162,6 +183,22 @@
             </div>
           </div>
 
+          <!-- REQ-22: camera capture surface. Hidden until the participant turns the
+               camera on, and the stream is stopped the moment they turn it off - the
+               capture exists for the instant they chose it, not for as long as they
+               forget it is running. -->
+          <div class="camera-panel hidden" id="camera-panel">
+            <div class="balance-header">
+              <span>📷 Camera Assist</span>
+              <span id="camera-hint" style="font-size: 11px; color: var(--macos-text-secondary);">Type a question below to ask about it</span>
+            </div>
+            <video id="camera-preview" class="camera-preview" autoplay muted playsinline></video>
+            <button class="macos-action-btn primary" id="btn-capture" style="width: 100%; margin-top: 6px;">
+              <span>✨</span>
+              <span id="btn-capture-text">Explain what I'm showing</span>
+            </button>
+          </div>
+
           <!-- Active Conversational Topic -->
           <div class="topic-card">
             <div class="topic-tag">🎯 Active Conversation Topic</div>
@@ -194,6 +231,19 @@
             <div class="subtitle-original-text">Welcome to your Tandem session! Speak naturally in Hindi, Japanese, or English. I'll provide live Romaji transliteration, cultural idiom scaffolding, and conversational prompts.</div>
           </div>
         </div>
+
+        <!-- REQ-21: ask the co-teacher something of your own, by text. The spoken form of
+             the same question is the existing "Talk to AI" control (REQ-09). Answers come
+             back to you alone - a private aside is not broadcast to the room. -->
+        <form class="query-bar" id="query-form" autocomplete="off">
+          <input class="query-input" id="query-input" type="text" maxlength="400"
+                 placeholder="Ask the co-teacher: what does this word mean? give me an example sentence…"
+                 aria-label="Ask the AI co-teacher a question" />
+          <button class="macos-action-btn primary" id="btn-ask" type="submit">
+            <span>💬</span>
+            <span id="btn-ask-text">Ask</span>
+          </button>
+        </form>
       </section>
 
       <!-- Right Column: AI Co-Teacher Scaffolding -->

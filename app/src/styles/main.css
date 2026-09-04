@@ -817,6 +817,77 @@ body {
   border: 1px solid var(--macos-border-subtle);
 }
 
+/* --------------------------------------------------------------------------
+   Direct query bar (REQ-21) and camera assist (REQ-22)
+   -------------------------------------------------------------------------- */
+.query-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px;
+  border-top: 1px solid var(--macos-border-subtle);
+  background: rgba(255, 255, 255, 0.6);
+  backdrop-filter: blur(12px);
+}
+
+.query-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--macos-text-primary);
+  background: #ffffff;
+  border: 1px solid var(--macos-border-subtle);
+  border-radius: 8px;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.query-input:focus {
+  border-color: var(--macos-accent-blue);
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.12);
+}
+
+.query-input:disabled {
+  background: rgba(0, 0, 0, 0.03);
+  color: var(--macos-text-secondary);
+}
+
+.answer-bubble .idiom-badge {
+  background: rgba(88, 86, 214, 0.12);
+  color: #5856d6;
+}
+
+.answer-text {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--macos-text-primary);
+  white-space: pre-wrap;
+}
+
+.camera-panel {
+  margin-top: 12px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid var(--macos-border-subtle);
+  border-radius: 12px;
+}
+
+.camera-panel.hidden {
+  display: none;
+}
+
+.camera-preview {
+  width: 100%;
+  max-height: 180px;
+  margin-top: 6px;
+  object-fit: cover;
+  background: #000000;
+  border-radius: 8px;
+  border: 1px solid var(--macos-border-subtle);
+}
+
 /* ==========================================================================
    9. Interactive Quiz Widget
    ========================================================================== */

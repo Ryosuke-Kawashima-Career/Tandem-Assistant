@@ -13,6 +13,8 @@ Key Classes and Objects:
 """
 
 import os
+import base64
+import binascii
 import json
 import time
 import queue
@@ -50,6 +52,7 @@ from src.artifacts.models import TranscriptTurn
 from src.artifacts.repository import LocalArtifactRepository, configured_retention_days
 from src.sessions.models import InvalidSessionModeError, SessionMode, SessionRecord
 from src.sessions.service import SessionNotFoundError, SessionService
+from src.sessions.speaking_balance import SpeakingBalanceTracker
 from src.translation.router import Participant, TranslationRouter
 from src.rtc.convoai_client import (
     ConvoAIClient,
@@ -142,6 +145,11 @@ class EchoSphereServer:
         # Session modes (REQ-12). One registry owns the mode for every channel, so
         # prompts, RTC events, quizzes, and notes all branch on the same answer.
         self.sessions = SessionService()
+
+        # Measured speaking time per channel (REQ-23). Separate from the session record
+        # because it is a running tally updated from whichever thread noticed a speech
+        # boundary, while a session's identity and mode are decided once.
+        self.speaking_balance = SpeakingBalanceTracker()
 
         # Session artifacts (REQ-13 / REQ-14). Generation is driven from the finalized
         # turn, off the voice-critical path, and publishes quiz.created / note.upserted
@@ -277,6 +285,9 @@ class EchoSphereServer:
         self.convoai_session_context[channel] = context
         self._convoai_last_channel = channel
         self.agent.reset_state()
+        # REQ-23: for the same reason the agent's state is reset - the channel is reused,
+        # the session is not, and a new learner must not be shown the previous one's share.
+        self.speaking_balance.reset(channel)
         logger.info(
             f"Convo AI session context registered for channel '{channel}' "
             f"(language: {language}, speaker: {speaker_id}, mode: {session.mode.value})."
@@ -433,6 +444,14 @@ class EchoSphereServer:
             transcription = self.stt.transcribe(text_or_audio, language=language, speaker_id=speaker_id)
             spoken_text = transcription.text
             detected_lang = transcription.language
+            # REQ-23: the transcription's duration is derived from the byte length at a
+            # known sample rate, so it is a measurement rather than an estimate - the one
+            # signal on the ambient path this balance may legitimately count. A text turn
+            # deliberately contributes nothing: there is no honest way to derive speaking
+            # time from a string, and guessing one puts the gauge back on invented data.
+            self.record_speaking_time(
+                channel or self.channel_name, speaker_id, transcription.duration_ms
+            )
         else:
             spoken_text = str(text_or_audio)
             detected_lang = language
@@ -459,6 +478,35 @@ class EchoSphereServer:
             self.rtc_client.publish_audio_frame(ai_audio)
 
         return turn_result
+
+    def record_speaking_time(
+        self,
+        channel: str,
+        speaker_id: str,
+        duration_ms: Any
+    ) -> Dict[str, int]:
+        """
+        Records one measured speech segment and broadcasts the new balance (REQ-23).
+
+        Algorithm:
+        1. Accumulate the segment against this channel's tally.
+        2. Broadcast the recalculated shares to every participant, not only to whoever
+           reported the segment - REQ-23 extends REQ-07's teacher-only metric to the
+           participant UI, and a motivation cue that only the reporter can see is not one.
+        3. Return the shares so the reporting caller can draw immediately.
+
+        Whether the segment counted is read from the tally rather than re-checked here:
+        the tracker owns the rule about what a usable segment is (REQ-23), and a second
+        copy of that rule in this method is a second thing to keep in step with it. A
+        segment that changed nothing publishes nothing, so the stream carries no events
+        that redraw an identical gauge.
+        """
+        recorded_before = self.speaking_balance.total_ms(channel)
+        percentages = self.speaking_balance.record(channel, speaker_id, duration_ms)
+
+        if self.speaking_balance.total_ms(channel) > recorded_before:
+            self.data_stream.send_speaking_balance(percentages)
+        return percentages
 
     def _broadcast_turn_payloads(
         self,
@@ -567,6 +615,34 @@ class EchoSphereServer:
         self._broadcast_turn_payloads(turn_result, speaker_id, text)
         self.generate_turn_artifacts(turn_result, speaker_id, text, channel, language)
         return turn_result
+
+    def answer_direct_query(
+        self,
+        channel: Optional[str],
+        question: str,
+        speaker_id: str = "Learner",
+        language: str = "en"
+    ) -> Dict[str, Any]:
+        """
+        Answers one participant's own question about the session (REQ-21).
+
+        Deliberately thin: it resolves the mode the answer must obey and delegates. What
+        matters is everything it does *not* do - no `generate_turn_artifacts`, no
+        `_broadcast_turn_payloads`, no recorded turn. A direct query is an aside beside
+        the conversation, so the only thing that leaves this method is the answer, back to
+        the one person who asked for it.
+
+        Not broadcast for the same reason: subtitles and cards describe the conversation
+        both peers are in, and a private question - "what did she just say?" - is not
+        that. Publishing it to the room would make the feature socially unusable in
+        exactly the moment somebody needs it.
+        """
+        return self.agent.answer_query(
+            question,
+            speaker_id=speaker_id,
+            detected_language=language,
+            session_mode=self.session_mode_for(channel)
+        )
 
     def generate_turn_artifacts(
         self,
@@ -855,6 +931,10 @@ def api_start_session():
     # retrievable by session id after the channel has moved on.
     server_instance.artifacts.save_session(session)
 
+    # REQ-23: a channel outlives the sessions held on it, so the new conversation starts
+    # from silence rather than inheriting the previous pair's speaking balance.
+    server_instance.speaking_balance.reset(channel)
+
     success = server_instance.start_session()
     return jsonify({
         "success": success,
@@ -885,6 +965,92 @@ def api_stop_session():
         "success": success,
         "channel": channel,
         "session_id": closed.session_id if closed else None
+    }), 200
+
+
+@app.route("/api/agent/query", methods=["POST"])
+def api_agent_query():
+    """
+    Answers one participant's direct question to the AI co-teacher (REQ-21).
+
+    The text path lives here rather than on the Convo AI voice pipeline because a typed
+    question has no audio leg to drive: routing it through the spoken path would start a
+    voice agent to answer something nobody asked out loud. A spoken question needs no new
+    endpoint - it is already the REQ-09 direct-AI conversation.
+
+    Governed like every other session endpoint (REQ-16). The answer is returned to the
+    caller and to nobody else; see `answer_direct_query` for why it is not broadcast.
+    """
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    body = request.get_json(silent=True) or {}
+    question = (body.get("text") or body.get("query") or "").strip()
+    if not question:
+        return jsonify({
+            "success": False,
+            "error": "A direct query needs a `text` question to answer."
+        }), 400
+
+    answer = server_instance.answer_direct_query(
+        meta.get("channel"),
+        question,
+        speaker_id=str(body.get("speaker_id") or resolve_actor(request) or "Learner"),
+        language=str(body.get("language") or "en")
+    )
+    return jsonify({
+        "success": True,
+        "channel": meta.get("channel"),
+        "session_id": meta["session_id"],
+        "answer": answer
+    }), 200
+
+
+@app.route("/api/session/speaking", methods=["POST"])
+def api_report_speaking_time():
+    """
+    Records one measured speech segment and broadcasts the balance (REQ-23).
+
+    The browser is the reporter because it is where a real measurement exists: the local
+    microphone track's own voice-activity boundaries. The server-side alternative would
+    need raw per-participant PCM, which is exactly what TASK-11.9 deferred - so reporting
+    a duration the client actually measured is the honest path to a real gauge, and it is
+    still the server that accumulates, computes, and publishes it.
+
+    Governed like every other session endpoint (REQ-16): speaking time is a claim about
+    who was talking in a conversation, and an ungoverned endpoint lets a stranger rewrite
+    somebody else's record of it.
+    """
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    body = request.get_json(silent=True) or {}
+    if "duration_ms" not in body:
+        return jsonify({
+            "success": False,
+            "error": "A speech segment needs a measured `duration_ms`."
+        }), 400
+
+    try:
+        duration_ms = int(body["duration_ms"])
+    except (TypeError, ValueError):
+        return jsonify({
+            "success": False,
+            "error": "`duration_ms` must be a whole number of milliseconds."
+        }), 400
+
+    channel = meta.get("channel") or server_instance.channel_name
+    speaker_id = str(body.get("speaker_id") or resolve_actor(request) or "").strip()
+
+    percentages = server_instance.record_speaking_time(channel, speaker_id, duration_ms)
+    return jsonify({
+        "success": True,
+        "channel": channel,
+        "session_id": meta["session_id"],
+        "speaker_percentages": percentages,
+        "total_ms": server_instance.speaking_balance.total_ms(channel)
     }), 200
 
 
@@ -1298,8 +1464,14 @@ def _resolve_governed_session(require_artifact: bool = False):
     Returns `(meta, artifact, None)` on success, or `(None, None, response)` carrying the
     404/403 the endpoint should return. Every artifact endpoint goes through here so the
     REQ-16 access check is structurally impossible to skip in one of them.
+
+    A multipart request (REQ-22's camera capture) carries no JSON body, so the form is
+    read as a fallback: without it, the one endpoint that has to upload a file would be
+    the one endpoint that could not name its session.
     """
     body = request.get_json(silent=True) or {}
+    if not body and request.form:
+        body = request.form.to_dict()
     meta = server_instance.resolve_artifact_session(
         channel=request.args.get("channel") or body.get("channel"),
         session_id=request.args.get("session_id") or body.get("session_id")
@@ -1591,6 +1763,64 @@ def api_tools_anki_export():
         _session_from_meta(meta), notes, deck=(body.get("deck") or None)
     )
     return _tool_response(result, "export", {"session_id": meta["session_id"]})
+
+
+@app.route("/api/tools/vision", methods=["POST"])
+def api_tools_vision():
+    """
+    Explains one captured camera frame as a material card (REQ-22).
+
+    Accepts the capture two ways because both are natural in a browser: a multipart
+    `image` file, which is what `canvas.toBlob` produces, or a base64 `image_base64`
+    field for a client that already holds a data URL. Base64 inflates the payload by a
+    third on a link that is already carrying a live conversation, so the file form is
+    preferred - but requiring it would push that encoding decision onto every caller.
+
+    The frame is passed to the tool and dropped: nothing here stores it, and REQ-22 is
+    explicit that no image persists past generating the card unless the participant
+    chooses to save the result as a note.
+    """
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    body = request.get_json(silent=True) or {}
+    if not body and request.form:
+        body = request.form.to_dict()
+
+    upload = request.files.get("image")
+    if upload is not None:
+        frame = upload.read()
+        mime_type = upload.mimetype or "image/jpeg"
+    else:
+        encoded = (body.get("image_base64") or "").strip()
+        # A data URL ("data:image/jpeg;base64,...") is what a canvas capture hands a
+        # client, so accept it rather than making the browser strip its own prefix.
+        if "," in encoded and encoded.lower().startswith("data:"):
+            encoded = encoded.split(",", 1)[1]
+        try:
+            frame = base64.b64decode(encoded, validate=True) if encoded else b""
+        except (ValueError, binascii.Error):
+            return jsonify({
+                "success": False,
+                "error": "`image_base64` is not valid base64 data."
+            }), 400
+        mime_type = (body.get("mime_type") or "image/jpeg").strip()
+
+    if not frame:
+        return jsonify({
+            "success": False,
+            "error": "A camera lookup needs an `image` file or `image_base64` data."
+        }), 400
+
+    result = server_instance.tools.describe_camera_frame(
+        _session_from_meta(meta),
+        frame,
+        mime_type=mime_type,
+        question=(body.get("question") or ""),
+        requested_by=resolve_actor(request) or ""
+    )
+    return _tool_response(result, "card", {"session_id": meta["session_id"]})
 
 
 @app.route("/api/tools/calendar/schedule", methods=["POST"])

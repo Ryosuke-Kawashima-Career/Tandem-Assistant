@@ -94,4 +94,11 @@ def resolve_actor(request: Any) -> Optional[str]:
 
     body = request.get_json(silent=True) or {}
     actor = body.get("actor") if isinstance(body, dict) else None
+    if actor:
+        return str(actor).strip()
+
+    # A multipart upload (REQ-22's camera capture) has form fields instead of a JSON
+    # body, and an uploader still has to be able to say who it is.
+    form = getattr(request, "form", None)
+    actor = form.get("actor") if form else None
     return str(actor).strip() if actor else None

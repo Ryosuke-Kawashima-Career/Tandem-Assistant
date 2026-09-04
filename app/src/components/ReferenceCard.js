@@ -90,6 +90,31 @@ export class ReferenceCard {
   }
 
   /**
+   * Renders the answer to one direct question (REQ-21).
+   *
+   * Shares this column with the tool cards because it answers the same kind of thing -
+   * "what did the assistant just produce for me" - but carries its own badge: this one
+   * was asked for privately and is shown only to the person who asked.
+   *
+   * The answer is rendered as text, never as HTML: it comes from a language model, and a
+   * model that has been fed a participant's own wording is not a trusted HTML source.
+   *
+   * @param {Object} answer - `{query, answer, mode}` from POST /api/agent/query
+   */
+  renderAnswer(answer) {
+    if (!this.container || !answer?.answer) return;
+
+    this.prepend(`
+      <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+        <span class="idiom-badge">💬 Your question</span>
+        <button class="traffic-light traffic-close" style="width: 10px; height: 10px; border: none; outline: none; cursor: pointer;" title="Dismiss"></button>
+      </div>
+      <div class="idiom-phrase">${this.escapeHtml(answer.query || '')}</div>
+      <div class="answer-text">${this.escapeHtml(answer.answer)}</div>
+    `, 'answer-bubble');
+  }
+
+  /**
    * Renders a scheduled follow-up meeting (REQ-20).
    */
   renderMeeting(payload) {
@@ -135,6 +160,32 @@ export class ReferenceCard {
   }
 
   /**
+   * Renders a plain outcome notice for an action the participant took (REQ-15).
+   *
+   * Exists because an export answers JSON, not a document: opening that JSON in a tab
+   * shows a person a raw error body, which reads exactly like nothing having happened.
+   *
+   * @param {string} title - Badge text, e.g. 'Notion Export'
+   * @param {string} message - What happened, in words meant to be read
+   * @param {boolean} [ok] - Whether it succeeded; only changes the leading icon
+   * @param {string} [link] - Optional URL to the thing that was created
+   */
+  renderNotice(title, message, ok = true, link = '') {
+    if (!this.container) return;
+
+    const safeLink = this.safeUrl(link);
+
+    this.prepend(`
+      <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+        <span class="idiom-badge">${ok ? '✅' : '⚠️'} ${this.escapeHtml(title)}</span>
+        <button class="traffic-light traffic-close" style="width: 10px; height: 10px; border: none; outline: none; cursor: pointer;" title="Dismiss"></button>
+      </div>
+      <div class="idiom-meaning">${this.escapeHtml(message)}</div>
+      ${safeLink ? `<div class="idiom-meaning"><a href="${safeLink}" target="_blank" rel="noopener noreferrer">Open it</a></div>` : ''}
+    `);
+  }
+
+  /**
    * Renders a tool that could not run (REQ-18–20).
    *
    * Shown rather than logged: someone pressed a button, and an unavailable tool that
@@ -156,10 +207,14 @@ export class ReferenceCard {
 
   /**
    * Inserts one card at the top of the container and prunes the overflow.
+   *
+   * @param {string} innerHtml - card body
+   * @param {string} variant - extra class, so a private answer reads differently from a
+   *                           broadcast reference card
    */
-  prepend(innerHtml) {
+  prepend(innerHtml, variant = 'reference-bubble') {
     const cardEl = document.createElement('div');
-    cardEl.className = 'idiom-bubble reference-bubble';
+    cardEl.className = `idiom-bubble ${variant}`;
     cardEl.innerHTML = innerHtml;
 
     const closeBtn = cardEl.querySelector('.traffic-close');

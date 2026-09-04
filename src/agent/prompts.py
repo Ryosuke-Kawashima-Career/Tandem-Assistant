@@ -495,6 +495,93 @@ Generate the required pedagogical annotations (subtitles with Romaji/translitera
     return prompt.strip()
 
 
+SYSTEM_PROMPT_DIRECT_QUERY = """
+You are "EchoSphere Tandem Co-Teacher", answering one participant's own question during a
+live session. They asked you directly - by typing, or by speaking to you rather than to
+the room.
+
+This is an aside, not a lesson turn:
+1. ANSWER THE QUESTION ASKED. Nothing else. Do not grade the question, do not correct how
+   it was phrased, and do not steer them back to the conversation.
+2. BE SHORT AND CONCRETE. A few sentences at most. If an example sentence answers it
+   better than an explanation, give the example.
+3. PLAIN TEXT ONLY. No markdown, no headings, no JSON, no emoji.
+4. SAY WHEN YOU DO NOT KNOW. A confident wrong answer about a word or a term is worse
+   than none, because it will be written down and reused.
+"""
+
+
+SYSTEM_PROMPT_DIRECT_QUERY_WORK = """
+You are "EchoSphere Work Assistant", answering one colleague's own question during a live
+work conversation. They asked you directly rather than asking the room.
+
+1. CLARIFY, DO NOT GRADE. Explain the terminology, the material, or the intent. Never
+   correct anyone's grammar, word choice, or language ability.
+2. BE SHORT AND CONCRETE. A few sentences at most.
+3. PLAIN TEXT ONLY. No markdown, no headings, no JSON, no emoji.
+4. SAY WHEN YOU DO NOT KNOW, and say what would settle it - who to ask, or which document
+   would say. An invented answer about a process or an acronym propagates.
+"""
+
+
+def create_query_prompt(
+    question: str,
+    recent_context: str = "",
+    speaker_name: str = "the participant",
+    primary_language: str = "English",
+    complementary_languages: Optional[List[str]] = None,
+    materials: bool = False
+) -> str:
+    """
+    Constructs the prompt for one direct participant question (REQ-21).
+
+    Algorithm:
+    1. State who is asking and what they asked.
+    2. Give the running conversation as context only - the question may be *about* it
+       ("what did she just say?"), which is unanswerable without it.
+    3. In `language_learning`, carry the REQ-17 language roles: explain in the primary
+       language, illustrate in the asker's own target language, and ask for an example
+       sentence, which is what REQ-21 names as the second thing participants want.
+    4. In `international_work`, ask for terminology and material clarification instead,
+       and say explicitly that the answer must not grade anyone's language.
+
+    Deliberately asks for plain speakable/readable text rather than the structured JSON
+    contract the mediation and tutor prompts use: this answer is rendered as one card and
+    read by one person, and none of the artifact fields apply to a question that is not
+    part of the lesson record.
+    """
+    asked = (question or "").strip()
+    context_block = f"""
+Conversation So Far (context only - do not analyze or grade it):
+\"\"\"
+{recent_context}
+\"\"\"
+""" if (recent_context or "").strip() else ""
+
+    if materials:
+        guidance = """Answer in English. Explain the terminology, the task material, or the
+intent behind the wording. Do not grade or comment on anyone's language."""
+    else:
+        roles = create_language_roles_block(
+            primary_language=primary_language,
+            complementary_languages=complementary_languages,
+            audience="solo"
+        )
+        guidance = f"""{roles}
+
+Answer the question directly, then give one short example sentence in the relevant
+complementary language with its reading and meaning."""
+
+    prompt = f"""
+{speaker_name} has asked you a question directly.
+{context_block}
+Their question: "{asked}"
+
+{guidance}
+"""
+    return prompt.strip()
+
+
 def create_silence_breaker_prompt(
     topic: str,
     target_language: str,

@@ -36,6 +36,7 @@ from src.agent.tools.base import (
 from src.agent.tools.email import ResendEmailSender
 from src.agent.tools.google_calendar import GoogleCalendarTool
 from src.agent.tools.google_search import GoogleSearchTool
+from src.agent.tools.vision import CameraVisionTool
 from src.artifacts.models import stable_entity_id
 
 logger = logging.getLogger("echosphere.agent.tools.dispatch")
@@ -60,6 +61,7 @@ class ToolDispatcher:
         calendar: Optional[GoogleCalendarTool] = None,
         anki: Optional[AnkiMCPTool] = None,
         email: Optional[ResendEmailSender] = None,
+        vision: Optional[CameraVisionTool] = None,
         executor: Optional[ThreadPoolExecutor] = None
     ):
         """
@@ -75,6 +77,7 @@ class ToolDispatcher:
         self.calendar = calendar
         self.anki = anki
         self.email = email
+        self.vision = vision
 
         self._executor = executor
         self._executor_lock = threading.Lock()
@@ -92,6 +95,7 @@ class ToolDispatcher:
             calendar=GoogleCalendarTool(),
             anki=AnkiMCPTool(),
             email=ResendEmailSender(),
+            vision=CameraVisionTool(),
             executor=executor
         )
 
@@ -107,6 +111,7 @@ class ToolDispatcher:
             "anki": self._is_configured(self.anki),
             "calendar": self._is_configured(self.calendar),
             "email": self._is_configured(self.email),
+            "vision": self._is_configured(self.vision),
         }
 
     @staticmethod
@@ -179,6 +184,74 @@ class ToolDispatcher:
         delaying a spoken reply - so this has to return before the vendor does.
         """
         return self._submit(self.search_reference, session, query, **kwargs)
+
+    # -- Camera Vision (REQ-22) ------------------------------------------------------
+
+    def describe_camera_frame(
+        self,
+        session: Any,
+        image_bytes: bytes,
+        mime_type: str = "image/jpeg",
+        question: str = "",
+        requested_by: str = ""
+    ) -> ToolResult:
+        """
+        Explains one captured camera frame and publishes the material card (REQ-22).
+
+        Algorithm:
+        1. Refuse audibly when the tool is unconfigured or absent.
+        2. Describe the frame, scoped by the session's mode: task material in
+           `international_work`, reading help in `language_learning`.
+        3. Publish one `reference.card` carrying the explanation - and never the frame.
+
+        The card reuses the REQ-18 result shape deliberately. A participant asking "what
+        is this?" by typing and by pointing a camera is asking one question, and two
+        differently shaped answers on the same column would be two things for them to
+        learn instead of one.
+
+        The captured frame is not included in the published payload: the card reaches
+        every participant, so embedding it would broadcast whatever else was in view to
+        the whole room and leave a copy in each client's event log.
+        """
+        if not self._is_configured(self.vision):
+            return self._status_event(
+                "vision", session, ToolState.UNAVAILABLE,
+                "Camera vision is not configured on this server."
+            )
+
+        asked = (question or "").strip() or "What is in this image?"
+        materials = not _grades_language(session)
+        language = _first_language(session)
+
+        try:
+            description = self.vision.describe(
+                image_bytes,
+                mime_type=mime_type,
+                question=asked,
+                language=language,
+                materials=materials
+            )
+        except ToolNotConfiguredError as exc:
+            return self._status_event("vision", session, ToolState.UNAVAILABLE, str(exc))
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            logger.warning("Describing a camera frame failed: %s", exc)
+            return self._status_event("vision", session, ToolState.FAILED, str(exc))
+
+        card = {
+            "query": asked,
+            "source": "camera",
+            "materials": materials,
+            "language": language,
+            "requested_by": requested_by,
+            "results": [{
+                "title": description.title,
+                "snippet": description.description,
+                "url": "",
+                "image_url": "",
+            }],
+        }
+        self._emit(EVENT_REFERENCE_CARD, session, "vision", "card", card, asked)
+        return ToolResult(tool="vision", state=ToolState.OK, payload=card)
 
     # -- Anki MCP (REQ-19) -----------------------------------------------------------
 

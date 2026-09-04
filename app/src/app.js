@@ -26,6 +26,11 @@ import { QuizWidget } from './components/QuizWidget.js';
 import { NotesPanel } from './components/NotesPanel.js';
 import { ReferenceCard } from './components/ReferenceCard.js';
 
+// How often stored notes and quizzes are re-read while a session is live. Chosen to be
+// fast enough that "automatic" still feels automatic, and slow enough that a session
+// left open for an hour costs a few hundred cheap reads rather than thousands.
+const ARTIFACT_POLL_INTERVAL_MS = 5000;
+
 class TandemApp {
   /**
    * Initialize Tandem Application.
@@ -71,6 +76,36 @@ class TandemApp {
     this.translatedAudioEnabled = false;
     this.translatedAudioChosen = false;
     this.translationLegs = {};
+
+    // Camera assist (REQ-22). The stream lives only while the panel is open; a capture is
+    // taken on demand and uploaded as one frame, so nothing is recorded or held.
+    this.cameraStream = null;
+    this.isCameraOn = false;
+
+    // Session timer (REQ-23). Client-side and approximate on purpose: it is a motivation
+    // cue, and the authoritative duration is the stored session's own timestamps.
+    this.sessionStartedAt = null;
+    this.sessionTimerHandle = null;
+
+    // Measured local speaking time (REQ-23). Sampled from this participant's own
+    // microphone track, which is the only place a real duration exists client-side, and
+    // reported to the server in batches - the server does the accumulating and the
+    // publishing, so every participant sees one agreed balance.
+    this.speechSampleHandle = null;
+    this.unreportedSpeechMs = 0;
+
+    // Session lifecycle (REQ-12 / D-UIUX-1). Joining the channel is what creates the
+    // backend session every session-governed endpoint resolves against; without it,
+    // search, direct query, camera assist, and export all answer "No such session."
+    this.sessionId = null;
+
+    // REST fallback for generated artifacts (D-UIUX-2). Notes and quizzes are generated
+    // server-side and stored, but the RTC data-stream that is supposed to announce them
+    // does not reach a real browser yet, so they are also polled while a session is live.
+    // Quiz ids are tracked because QuizWidget appends a card per call and has no id map
+    // of its own; NotesPanel already dedupes by note id.
+    this.artifactPollHandle = null;
+    this.renderedQuizIds = new Set();
 
     // Live transcripts and agent state, delivered over RTM by the Convo AI Engine
     this.transcriptService = new ConvoAITranscriptService();
@@ -249,8 +284,12 @@ class TandemApp {
   updateToolControls() {
     const controls = [
       ['btn-research', 'search', 'Google Search is not configured on this server.'],
-      ['btn-anki', 'anki', 'No Anki MCP server is configured on this server.'],
       ['btn-schedule', 'calendar', 'Google Calendar is not configured on this server.'],
+      ['btn-camera', 'vision', 'Camera assist needs GEMINI_API_KEY on this server.'],
+      // Anki lives in the export selector rather than in its own toolbar button, but
+      // the availability rule is the same: an option nothing backs is disabled, not
+      // hidden, so the feature is visible as unconfigured rather than absent.
+      ['export-option-anki', 'anki', 'No Anki MCP server is configured on this server.'],
     ];
 
     controls.forEach(([id, tool, unavailableHint]) => {
@@ -301,7 +340,13 @@ class TandemApp {
         body: JSON.stringify({ channel: this.channelName, actor: this.speakerId })
       });
       console.log('🗂️ Anki export:', body);
+      // The receipt normally arrives as an `anki.exported` data event; rendering it here
+      // too is what makes the export visible in a session with no live data stream.
+      this.referenceCard.renderExport(body);
     } catch (err) {
+      // Shown, not only logged: somebody pressed Export, and a silent failure is
+      // indistinguishable from a button that does nothing.
+      this.referenceCard.renderNotice('Anki Export', err.message, false);
       console.warn('🗂️ Anki export failed:', err.message);
     }
   }
@@ -339,6 +384,316 @@ class TandemApp {
       console.log('📅 Meeting scheduled:', body);
     } catch (err) {
       console.warn('📅 Scheduling failed:', err.message);
+    }
+  }
+
+  /**
+   * Asks the AI co-teacher one question of the participant's own (REQ-21).
+   *
+   * The answer is rendered from this response rather than awaited over the data stream,
+   * because it is deliberately not broadcast: a private "what does this word mean" is
+   * not part of the conversation both peers are in.
+   */
+  async askDirectQuery() {
+    const input = document.getElementById('query-input');
+    const button = document.getElementById('btn-ask');
+    const question = (input?.value || '').trim();
+    if (!question) return;
+
+    // Locked while in flight so an impatient second Enter does not ask twice, and
+    // cleared immediately so the box is ready for the next question either way.
+    if (input) { input.value = ''; input.disabled = true; }
+    if (button) button.disabled = true;
+
+    try {
+      const body = await requestJson('/api/agent/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel: this.channelName,
+          actor: this.speakerId,
+          speaker_id: this.speakerId,
+          text: question
+        })
+      });
+      this.referenceCard.renderAnswer(body?.answer);
+    } catch (err) {
+      // Shown, not only logged: somebody typed a question and pressed a button, and an
+      // answer that never appears is indistinguishable from one that was never asked.
+      this.referenceCard.renderStatus({
+        tool: 'co-teacher',
+        state: 'failed',
+        reason: `Could not answer "${question}": ${err.message}`
+      });
+    } finally {
+      if (input) { input.disabled = false; input.focus(); }
+      if (button) button.disabled = false;
+    }
+  }
+
+  /**
+   * Turns the camera assist panel on or off (REQ-22).
+   *
+   * The stream is requested when the panel opens and stopped when it closes, rather than
+   * held for the session: the camera exists for the moment the participant chose to show
+   * something, and a preview left running is a camera nobody remembers is on.
+   */
+  async toggleCamera() {
+    const panel = document.getElementById('camera-panel');
+    const video = document.getElementById('camera-preview');
+
+    if (this.isCameraOn) {
+      this.stopCamera();
+      return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      this.referenceCard.renderStatus({
+        tool: 'vision', state: 'unavailable',
+        reason: 'This browser exposes no camera API. A secure origin (https or localhost) is required.'
+      });
+      return;
+    }
+
+    try {
+      this.cameraStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment', width: { ideal: 1280 } },
+        audio: false
+      });
+    } catch (err) {
+      this.referenceCard.renderStatus({
+        tool: 'vision', state: 'unavailable',
+        reason: `Camera unavailable: ${err.message}`
+      });
+      return;
+    }
+
+    if (video) {
+      video.srcObject = this.cameraStream;
+      await video.play().catch(() => {});
+    }
+    if (panel) panel.classList.remove('hidden');
+    this.isCameraOn = true;
+    this.updateCameraUi();
+  }
+
+  /**
+   * Releases the camera and hides its panel.
+   */
+  stopCamera() {
+    const panel = document.getElementById('camera-panel');
+    const video = document.getElementById('camera-preview');
+
+    if (this.cameraStream) {
+      this.cameraStream.getTracks().forEach((track) => track.stop());
+      this.cameraStream = null;
+    }
+    if (video) video.srcObject = null;
+    if (panel) panel.classList.add('hidden');
+    this.isCameraOn = false;
+    this.updateCameraUi();
+  }
+
+  /**
+   * Reflects camera state in the toolbar control.
+   */
+  updateCameraUi() {
+    const btn = document.getElementById('btn-camera');
+    const text = document.getElementById('btn-camera-text');
+    if (btn) {
+      btn.classList.toggle('danger', this.isCameraOn);
+      btn.setAttribute('aria-pressed', String(this.isCameraOn));
+    }
+    if (text) text.textContent = this.isCameraOn ? 'Stop Camera' : 'Camera Assist';
+  }
+
+  /**
+   * Captures one frame and asks the co-teacher to explain it (REQ-22).
+   *
+   * Algorithm:
+   * 1. Draw the current video frame onto an offscreen canvas at its own resolution.
+   * 2. Encode it as JPEG and upload it as a multipart file - which is what the canvas
+   *    produces natively, and a third smaller than the base64 alternative.
+   * 3. Render the returned material card.
+   *
+   * The blob is never stored: it exists between the capture and the upload, and the
+   * server discards it after describing it (REQ-22).
+   */
+  async captureCameraFrame() {
+    const video = document.getElementById('camera-preview');
+    const button = document.getElementById('btn-capture');
+    const captureText = document.getElementById('btn-capture-text');
+
+    if (!video?.videoWidth) {
+      this.referenceCard.renderStatus({
+        tool: 'vision', state: 'failed',
+        reason: 'The camera has not produced a frame yet. Give it a moment and try again.'
+      });
+      return;
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+    if (!blob) return;
+
+    const question = (document.getElementById('query-input')?.value || '').trim();
+    const form = new FormData();
+    form.append('image', blob, 'capture.jpg');
+    form.append('question', question || 'What is in this image, and what does it say?');
+
+    if (button) button.disabled = true;
+    if (captureText) captureText.textContent = 'Looking…';
+
+    try {
+      const params = new URLSearchParams({ channel: this.channelName, actor: this.speakerId });
+      const body = await requestJson(`/api/tools/vision?${params.toString()}`, {
+        method: 'POST',
+        body: form
+      });
+      this.referenceCard.renderReference({ card: body?.card });
+    } catch (err) {
+      this.referenceCard.renderStatus({
+        tool: 'vision', state: 'failed',
+        reason: `Could not explain the captured frame: ${err.message}`
+      });
+    } finally {
+      if (button) button.disabled = false;
+      if (captureText) captureText.textContent = "Explain what I'm showing";
+    }
+  }
+
+  /**
+   * Starts the session elapsed-time display (REQ-23).
+   *
+   * Local and approximate by design. It answers "how long have I been practising today",
+   * which is a motivation question - not "how long was this session", which is a matter
+   * of record and belongs to the stored artifact's own timestamps (REQ-16).
+   */
+  startSessionTimer() {
+    this.sessionStartedAt = Date.now();
+    this.renderSessionTimer();
+    if (this.sessionTimerHandle) clearInterval(this.sessionTimerHandle);
+    this.sessionTimerHandle = setInterval(() => this.renderSessionTimer(), 1000);
+  }
+
+  /**
+   * Stops the elapsed-time display and freezes it at the final duration.
+   */
+  stopSessionTimer() {
+    if (this.sessionTimerHandle) {
+      clearInterval(this.sessionTimerHandle);
+      this.sessionTimerHandle = null;
+    }
+    this.renderSessionTimer();
+    this.sessionStartedAt = null;
+  }
+
+  /**
+   * Renders the elapsed time as mm:ss, or hh:mm:ss once a session runs past an hour.
+   */
+  renderSessionTimer() {
+    const pill = document.getElementById('session-timer');
+    if (!pill) return;
+
+    if (!this.sessionStartedAt) {
+      pill.textContent = '⏱️ 00:00';
+      return;
+    }
+
+    const elapsed = Math.max(0, Math.floor((Date.now() - this.sessionStartedAt) / 1000));
+    const hours = Math.floor(elapsed / 3600);
+    const minutes = Math.floor((elapsed % 3600) / 60);
+    const seconds = elapsed % 60;
+    const pad = (value) => String(value).padStart(2, '0');
+
+    pill.textContent = hours
+      ? `⏱️ ${pad(hours)}:${pad(minutes)}:${pad(seconds)}`
+      : `⏱️ ${pad(minutes)}:${pad(seconds)}`;
+  }
+
+  /**
+   * Starts measuring this participant's own speaking time (REQ-23).
+   *
+   * Algorithm:
+   * 1. Sample the local microphone track's volume level on a fixed interval.
+   * 2. Count a sample above the speech threshold as that interval of speech.
+   * 3. Report the accumulated milliseconds to the server in batches.
+   *
+   * The browser is the measurer because it is the only place a real per-participant
+   * duration exists today: the backend has no raw per-speaker PCM (TASK-11.9 is
+   * deferred), and REQ-23 refuses an invented number. The server still owns the
+   * accumulation and the publication, so every client renders one agreed balance rather
+   * than its own local guess.
+   */
+  startSpeechMeasurement() {
+    if (!this.localAudioTrack || this.speechSampleHandle) return;
+
+    const SAMPLE_MS = 250;
+    // Above room noise but below normal speech. Agora reports 0..1; a quiet room floats
+    // around 0.01-0.03, so counting anything audible would report silence as speech.
+    const SPEECH_LEVEL = 0.08;
+    const REPORT_EVERY_MS = 3000;
+
+    this.unreportedSpeechMs = 0;
+    this.speechSampleHandle = setInterval(() => {
+      if (!this.localAudioTrack) return;
+
+      let level = 0;
+      try {
+        level = this.localAudioTrack.getVolumeLevel();
+      } catch (err) {
+        return;
+      }
+
+      if (level >= SPEECH_LEVEL) this.unreportedSpeechMs += SAMPLE_MS;
+      if (this.unreportedSpeechMs >= REPORT_EVERY_MS) {
+        const measured = this.unreportedSpeechMs;
+        this.unreportedSpeechMs = 0;
+        this.reportSpeakingTime(measured);
+      }
+    }, SAMPLE_MS);
+  }
+
+  /**
+   * Stops sampling and reports whatever was measured but not yet sent.
+   */
+  stopSpeechMeasurement() {
+    if (this.speechSampleHandle) {
+      clearInterval(this.speechSampleHandle);
+      this.speechSampleHandle = null;
+    }
+    if (this.unreportedSpeechMs > 0) {
+      const measured = this.unreportedSpeechMs;
+      this.unreportedSpeechMs = 0;
+      this.reportSpeakingTime(measured);
+    }
+  }
+
+  /**
+   * Sends one measured speech batch to the server (REQ-23).
+   *
+   * Failures are logged and dropped rather than retried: the balance is a live cue, and
+   * a queue of stale segments replayed later would describe a conversation that has
+   * already moved on.
+   */
+  async reportSpeakingTime(durationMs) {
+    try {
+      await requestJson('/api/session/speaking', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel: this.channelName,
+          actor: this.speakerId,
+          speaker_id: this.speakerId,
+          duration_ms: Math.round(durationMs)
+        })
+      });
+    } catch (err) {
+      console.log('ℹ️ Speaking time not reported:', err.message);
     }
   }
 
@@ -389,15 +744,54 @@ class TandemApp {
   }
 
   /**
-   * Opens this channel's stored session artifact as Markdown (REQ-15).
+   * Exports this channel's stored session artifact to the chosen destination (REQ-15).
    *
    * The actor travels with the request because the backend authorizes artifact access
    * against the session's participants (REQ-16).
+   *
+   * Algorithm:
+   * 1. Read the destination from the export selector; Anki has its own endpoint.
+   * 2. Markdown is a document, so it is opened in a tab - the browser renders and saves
+   *    it better than this UI could.
+   * 3. Notion answers JSON, so it is fetched and reported as a card. Opening that JSON
+   *    in a tab is what made an unconfigured Notion look like a button that did nothing.
    */
-  exportSession() {
-    const url = `/api/session/artifact/export?channel=${encodeURIComponent(this.channelName)}`
-      + `&format=markdown&actor=${encodeURIComponent(this.speakerId)}`;
-    window.open(url, '_blank', 'noopener');
+  async exportSession() {
+    const select = document.getElementById('export-format');
+    const destination = select?.value || 'markdown';
+
+    if (destination === 'anki') {
+      await this.exportToAnki();
+      return;
+    }
+
+    const params = new URLSearchParams({
+      channel: this.channelName,
+      actor: this.speakerId
+    });
+
+    if (destination === 'markdown') {
+      params.set('format', 'markdown');
+      window.open(`/api/session/artifact/export?${params.toString()}`, '_blank', 'noopener');
+      return;
+    }
+
+    params.set('format', 'notion');
+    params.set('target', destination === 'notion-database' ? 'database' : 'page');
+
+    try {
+      const body = await requestJson(`/api/session/artifact/export?${params.toString()}`);
+      const notion = body?.notion || {};
+      this.referenceCard.renderNotice(
+        'Notion Export',
+        `This session was exported to your Notion ${notion.target || 'page'}.`,
+        true,
+        notion.url
+      );
+    } catch (err) {
+      this.referenceCard.renderNotice('Notion Export', err.message, false);
+      console.warn('📤 Notion export failed:', err.message);
+    }
   }
 
   /**
@@ -614,9 +1008,8 @@ class TandemApp {
     });
     this.setSessionMode(this.currentMode);
 
-    // Export the stored session (REQ-15). Opened in a new tab rather than fetched and
-    // re-rendered: the export is a document, and the browser already knows how to show
-    // and save one.
+    // Export the stored session (REQ-15 / REQ-19). One control, one destination
+    // selector: Markdown opens as a document, Notion and Anki report back as cards.
     const btnExport = document.getElementById('btn-export');
     if (btnExport) {
       btnExport.addEventListener('click', () => this.exportSession());
@@ -629,14 +1022,30 @@ class TandemApp {
       btnResearch.addEventListener('click', () => this.researchTopic());
     }
 
-    const btnAnki = document.getElementById('btn-anki');
-    if (btnAnki) {
-      btnAnki.addEventListener('click', () => this.exportToAnki());
-    }
-
     const btnSchedule = document.getElementById('btn-schedule');
     if (btnSchedule) {
       btnSchedule.addEventListener('click', () => this.scheduleFollowUp());
+    }
+
+    // Camera assist (REQ-22), gated on the same availability check as the tools above.
+    const btnCamera = document.getElementById('btn-camera');
+    if (btnCamera) {
+      btnCamera.addEventListener('click', () => this.toggleCamera());
+    }
+
+    const btnCapture = document.getElementById('btn-capture');
+    if (btnCapture) {
+      btnCapture.addEventListener('click', () => this.captureCameraFrame());
+    }
+
+    // Direct query (REQ-21). A form rather than a click handler, so Enter in the box
+    // asks the question - which is how anyone actually uses a text field.
+    const queryForm = document.getElementById('query-form');
+    if (queryForm) {
+      queryForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        this.askDirectQuery();
+      });
     }
 
     // Join Channel Button
@@ -666,11 +1075,17 @@ class TandemApp {
 
     // Release the agent if the learner closes the tab mid-conversation
     window.addEventListener('beforeunload', () => {
+      const payload = new Blob(
+        [JSON.stringify({ channel: this.channelName })],
+        { type: 'application/json' }
+      );
+
       if (this.isAiActive || this.isAiPending) {
-        navigator.sendBeacon(
-          '/api/convoai/stop',
-          new Blob([JSON.stringify({ channel: this.channelName })], { type: 'application/json' })
-        );
+        navigator.sendBeacon('/api/convoai/stop', payload);
+      } else if (this.isJoined) {
+        // Closing the tab is leaving the channel, and a session nobody is in must not
+        // be inherited by whoever joins next.
+        navigator.sendBeacon('/api/session/stop', payload);
       }
     });
 
@@ -829,6 +1244,127 @@ class TandemApp {
   }
 
   /**
+   * Starts the backend session this channel's tools are governed by (REQ-12).
+   *
+   * Called on every join path - live, mic-blocked, and simulated - because a session is
+   * what makes search, direct query, camera assist, notes, quizzes, and export resolve
+   * at all; whether RTC audio itself came up is a separate question.
+   *
+   * Failure is logged and swallowed on purpose: a session-start failure must not strand
+   * an otherwise working voice connection. The session-dependent controls already report
+   * their own unavailability when used (`tool.status` / a 404 notice).
+   *
+   * `participants` lists only this client's own speaker id. The peer cards in the left
+   * column are static demo text, not captured identities, so naming them here would
+   * record participants who were never in the session.
+   */
+  async startSession() {
+    try {
+      const body = await requestJson('/api/session/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel: this.channelName,
+          mode: this.currentMode,
+          participants: [this.speakerId]
+        })
+      });
+      const previousId = this.sessionId;
+      this.sessionId = body?.session_id || null;
+      // A different session is a different set of artifacts: what the poll already
+      // rendered belongs to the old one and must not suppress the new one's quizzes.
+      if (previousId && previousId !== this.sessionId) this.renderedQuizIds.clear();
+      console.log(`🗂️ Session ${this.sessionId} started on '${this.channelName}'.`);
+      return true;
+    } catch (err) {
+      console.warn('Could not start the backend session:', err.message);
+      this.sessionId = null;
+      return false;
+    }
+  }
+
+  /**
+   * Ends the backend session so a rejoin starts clean rather than inheriting this one.
+   */
+  async stopSession() {
+    try {
+      await requestJson('/api/session/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel: this.channelName })
+      });
+    } catch (err) {
+      console.warn('Could not stop the backend session:', err.message);
+    }
+    this.sessionId = null;
+  }
+
+  /**
+   * Begins polling for stored notes and quizzes while a session is live (D-UIUX-2).
+   *
+   * Interim delivery, not a replacement for push: generation is already automatic
+   * server-side, and this is what makes it visible until a real event transport exists.
+   */
+  startArtifactPolling() {
+    if (this.artifactPollHandle) return;
+    this.refreshSessionArtifacts();
+    this.artifactPollHandle = window.setInterval(
+      () => this.refreshSessionArtifacts(),
+      ARTIFACT_POLL_INTERVAL_MS
+    );
+  }
+
+  /**
+   * Stops the artifact poll and forgets which quizzes were rendered, so the next
+   * session's identically-worded quiz is not mistaken for one already on screen.
+   */
+  stopArtifactPolling() {
+    if (this.artifactPollHandle) {
+      window.clearInterval(this.artifactPollHandle);
+      this.artifactPollHandle = null;
+    }
+    this.renderedQuizIds.clear();
+  }
+
+  /**
+   * Renders any note or quiz the session has produced that is not on screen yet.
+   *
+   * Algorithm:
+   * 1. Skip when no session is live - the endpoints are session-governed and would 404.
+   * 2. Upsert every note; NotesPanel is keyed by note id, so a re-sent note replaces
+   *    itself rather than duplicating, exactly as the data-stream path behaves.
+   * 3. Render only quizzes whose id has not been rendered before.
+   *
+   * A failed poll is logged once and left alone: the session may simply have ended
+   * between two ticks, and a retry storm of visible errors helps nobody.
+   */
+  async refreshSessionArtifacts() {
+    if (!this.isJoined && !this.isAiActive) return;
+
+    const params = new URLSearchParams({
+      channel: this.channelName,
+      actor: this.speakerId
+    });
+
+    try {
+      const [notesBody, quizBody] = await Promise.all([
+        requestJson(`/api/session/notes?${params.toString()}`),
+        requestJson(`/api/session/quizzes?${params.toString()}`)
+      ]);
+
+      (notesBody?.notes || []).forEach((note) => this.notesPanel.upsert({ note }));
+
+      (quizBody?.quizzes || []).forEach((quiz) => {
+        if (!quiz?.id || this.renderedQuizIds.has(quiz.id)) return;
+        this.renderedQuizIds.add(quiz.id);
+        this.quizWidget.renderQuiz(this.quizFromArtifact(quiz));
+      });
+    } catch (err) {
+      console.log('ℹ️ Session artifacts unavailable:', err.message);
+    }
+  }
+
+  /**
    * Joins or leaves the Agora RTC Channel.
    *
    * Algorithm:
@@ -888,7 +1424,17 @@ class TandemApp {
           console.log('ℹ️ Joined in simulated mode — set AGORA_APP_ID to enable live audio.');
         }
 
+        // D-UIUX-1: the backend session is created here, on every join path, because
+        // it - not the RTC connection - is what search, direct query, camera assist,
+        // notes, quizzes, and export are all governed by.
+        await this.startSession();
+
         this.isJoined = true;
+        // REQ-23: the session clock starts when the participant joins, and speech
+        // measurement starts with it when there is a real microphone track to measure.
+        this.startSessionTimer();
+        this.startSpeechMeasurement();
+        this.startArtifactPolling();
         if (btnJoinText) btnJoinText.textContent = 'Leave Channel';
         if (btnJoin) btnJoin.classList.add('danger');
         if (btnMic) btnMic.disabled = false;
@@ -897,20 +1443,33 @@ class TandemApp {
         // Microphone denial or RTC failure must not strand the UI in a half-joined state.
         console.warn('RTC Connect Notice (Running in Local Mode):', err);
         await this.releaseRtcResources();
+        await this.startSession();
         this.isJoined = true;
+        this.startSessionTimer();
+        this.startArtifactPolling();
         if (btnJoinText) btnJoinText.textContent = 'Leave Channel';
         if (btnJoin) btnJoin.classList.add('danger');
         if (btnMic) btnMic.disabled = false;
         if (connStatus) connStatus.textContent = 'Simulated Audio (Mic Unavailable)';
       }
     } else {
+      // Marked as left first: stopConvoAI() re-creates the session for a participant
+      // who is still in the channel, and on this path nobody is.
+      this.isJoined = false;
+
       // Stop any running AI agent before tearing down the channel.
       if (this.isAiActive) {
         await this.stopConvoAI();
       }
 
       await this.releaseRtcResources();
-      this.isJoined = false;
+      this.stopArtifactPolling();
+      // A rejoin must start a new session rather than reuse this one's notes, quizzes,
+      // and speaking balance - the channel outlives the session, the session does not.
+      await this.stopSession();
+      // The camera belongs to the session too: leaving the channel must not leave a
+      // capture stream running behind a hidden panel (REQ-22).
+      this.stopCamera();
 
       if (btnJoinText) btnJoinText.textContent = 'Join Channel';
       if (btnJoin) btnJoin.classList.remove('danger');
@@ -966,6 +1525,11 @@ class TandemApp {
    */
   async releaseRtcResources() {
     await this.transcriptService.disconnect();
+
+    // REQ-23: stop sampling before the track it samples is closed, and flush whatever
+    // was measured but not yet reported - the last few seconds of speech count too.
+    this.stopSpeechMeasurement();
+    this.stopSessionTimer();
 
     if (this.localAudioTrack) {
       this.localAudioTrack.close();
@@ -1116,6 +1680,12 @@ class TandemApp {
     this.setModeSwitcherLocked(false);
     this.teacherBar.setVisible(false);
     this.updateConvoAIUi(reason ? 'error' : 'idle', reason);
+
+    // Stopping the agent ends the session the backend registered for it. Someone still
+    // in the channel has not left, so the session the channel's tools resolve against
+    // is re-created rather than left absent until the next join (D-UIUX-1).
+    if (this.isJoined) await this.startSession();
+
     console.log('🛑 Convo AI agent stopped.');
   }
 
@@ -1189,16 +1759,32 @@ class TandemApp {
 
   /**
    * Executes a realistic multi-turn simulated tandem dialogue demo.
-   * 
+   *
    * Algorithm:
+   * 0. Refuse to run while a session is live (REQ-23).
    * 1. Dispatches timed stream packets across Japanese, Hindi, and English.
    * 2. Injects live subtitles with Romaji transliterations.
    * 3. Dispatches cultural idiom cards (e.g. Ichigo Ichie, Jugaad).
-   * 4. Updates real-time speaking balance metrics.
+   * 4. Replays a scripted speaking balance for the offline preview only.
    * 5. Triggers an AI interactive comprehension quiz.
+   *
+   * Step 0 is the point of REQ-23's other half. This timeline's `speaking_balance`
+   * packets - 70/30, then 52/48 - were for a long time the *only* balance this UI ever
+   * showed, and they describe nobody: they are a fixture on a timer. Left runnable during
+   * a live conversation, they would overwrite the measured balance with invented numbers,
+   * which is worse than showing none. It stays available for previewing the UI with no
+   * backend, and says plainly that is what it is.
    */
   runSimulationDemo() {
-    console.log('▶️ Running Tandem Multi-Lingual Simulation Demo...');
+    if (this.isJoined || this.isAiActive || this.isAiPending) {
+      console.warn(
+        '▶️ The simulation is an offline UI preview and would overwrite the measured '
+        + 'speaking balance with scripted values. Leave the channel to run it.'
+      );
+      return;
+    }
+
+    console.log('▶️ Running Tandem Multi-Lingual Simulation Demo (scripted, offline preview)...');
 
     const demoTimeline = [
       {

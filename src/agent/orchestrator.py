@@ -23,6 +23,9 @@ from src.agent.prompts import (
     SYSTEM_PROMPT_TANDEM_TUTOR_VOICE,
     SYSTEM_PROMPT_INTERNATIONAL_WORK,
     SYSTEM_PROMPT_INTERNATIONAL_WORK_VOICE,
+    SYSTEM_PROMPT_DIRECT_QUERY,
+    SYSTEM_PROMPT_DIRECT_QUERY_WORK,
+    create_query_prompt,
     create_teaching_prompt,
     create_tutor_prompt,
     create_tutor_voice_prompt,
@@ -485,6 +488,120 @@ class TeachingAgent:
             return text[:MAX_RESEARCH_QUERY_CHARS]
 
         return None
+
+    def build_query_prompt(
+        self,
+        question: str,
+        speaker_id: str = "the participant",
+        detected_language: str = "en",
+        session_mode: Any = None
+    ) -> str:
+        """
+        Builds the prompt for one direct participant question (REQ-21).
+
+        The asker's own target language leads the complementary list, so an example
+        sentence comes back in the language *they* are practising rather than in their
+        partner's - which is the whole difference between an answer they can use and one
+        aimed at the other side of the pair.
+        """
+        mode = self.resolve_session_mode(session_mode)
+        complementary = self.complementary_languages()
+        asker_language = self.peer_target_languages.get(speaker_id)
+        if asker_language:
+            complementary = [asker_language] + [
+                language for language in complementary if language != asker_language
+            ]
+
+        return create_query_prompt(
+            question=question,
+            recent_context=self.format_history_context(),
+            speaker_name=speaker_id or "the participant",
+            primary_language=self.primary_language,
+            complementary_languages=complementary,
+            materials=(mode is SessionMode.INTERNATIONAL_WORK)
+        )
+
+    def answer_query(
+        self,
+        question: str,
+        speaker_id: str = "Learner",
+        detected_language: str = "en",
+        session_mode: Any = None
+    ) -> Dict[str, Any]:
+        """
+        Answers one question a participant asked the assistant directly (REQ-21).
+
+        Algorithm:
+        1. Refuse an empty question rather than asking a model to guess at one.
+        2. Build the mode-appropriate prompt and system prompt.
+        3. Answer as plain text, reusing the streaming provider paths and joining them.
+        4. Return the answer alone - no notes, no quiz, no recorded turn.
+
+        Step 4 is the requirement, not an optimization. `turn_history` is the model's
+        context for mediating the *peer* conversation: a learner's private lookup landing
+        in it makes the co-teacher reply to something the other peer never heard, and
+        REQ-15's approval-free upsert would then export that aside as part of the shared
+        record of the session.
+
+        The streaming helpers are reused rather than `_call_openai` / `_call_gemini`
+        because those are the JSON-contract paths (REQ-04); an answer to "what does this
+        word mean" is prose, and constraining it to the artifact schema would produce a
+        note-shaped object where a sentence was wanted.
+        """
+        asked = (question or "").strip()
+        if not asked:
+            raise ValueError("A direct query needs a question to answer.")
+
+        mode = self.resolve_session_mode(session_mode)
+        prompt = self.build_query_prompt(
+            asked, speaker_id=speaker_id,
+            detected_language=detected_language, session_mode=mode
+        )
+        system_prompt = (
+            SYSTEM_PROMPT_DIRECT_QUERY_WORK
+            if mode is SessionMode.INTERNATIONAL_WORK
+            else SYSTEM_PROMPT_DIRECT_QUERY
+        )
+
+        answer = ""
+        try:
+            if self.engine in ("openai", "whisper") and self._openai_client:
+                answer = "".join(self._stream_openai(prompt, system_prompt))
+            elif self.engine == "gemini" and self._gemini_client:
+                answer = "".join(self._stream_gemini(prompt, system_prompt))
+        except Exception as exc:  # noqa: BLE001 - a failed lookup must not raise into a session
+            logger.warning("Direct query answer failed, falling back to offline: %s", exc)
+            answer = ""
+
+        if not answer.strip():
+            answer = self._mock_query_answer(asked, mode)
+
+        return {
+            "query": asked,
+            "answer": answer.strip(),
+            "language": self.primary_language,
+            "speaker_id": speaker_id,
+            "mode": mode.value,
+        }
+
+    def _mock_query_answer(self, question: str, mode: SessionMode) -> str:
+        """
+        Returns the offline answer for a direct query.
+
+        Says outright that it is offline: a canned sentence that reads like a real answer
+        is the one failure mode that matters here, because a participant writes down what
+        the assistant tells them about a word.
+        """
+        if mode is SessionMode.INTERNATIONAL_WORK:
+            return (
+                f"(offline mode) I cannot look up \"{question}\" without a configured "
+                "model. Set ECHOSPHERE_ENGINE and a provider key to get a real answer."
+            )
+        return (
+            f"(offline mode) You asked about \"{question}\". With a configured model I "
+            "would explain it in English and give an example sentence in your target "
+            "language. Set ECHOSPHERE_ENGINE and a provider key to enable that."
+        )
 
     def process_turn(
         self,
