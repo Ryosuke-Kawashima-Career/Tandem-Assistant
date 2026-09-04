@@ -177,23 +177,33 @@ def create_tutor_prompt(
     target_language: str = "Japanese",
     native_language: str = "English",
     learner_name: str = "the student",
-    topic: Optional[str] = None
+    topic: Optional[str] = None,
+    primary_language: str = "English",
+    complementary_languages: Optional[List[str]] = None
 ) -> str:
     """
     Constructs an LLM prompt for a direct 1:1 spoken conversation (REQ-LLM-03).
 
     Algorithm:
-    1. Incorporate the active topic and target/native language pairing.
+    1. Incorporate the active topic and the REQ-17 language roles.
     2. Incorporate the recent conversation history for this session only.
     3. Instruct the model to reply to the newest utterance and emit structured JSON.
 
     Deliberately carries no speaking-time metrics and names no second participant: the
-    Convo AI path has exactly one human in the channel.
+    Convo AI path has exactly one human in the channel. The language roles still apply -
+    a 1:1 learner is scaffolded in English and practises in their own target language,
+    the same policy their peer session runs under.
     """
     topic_str = f"Current Discussion Topic: {topic}\n" if topic else ""
+    roles = create_language_roles_block(
+        primary_language=primary_language,
+        complementary_languages=complementary_languages or [target_language],
+        audience="solo"
+    )
 
     prompt = f"""
-{topic_str}Target Language: {target_language}
+{topic_str}{roles}
+Target Language: {target_language}
 Native Language: {native_language}
 You are speaking privately with: {learner_name}
 
@@ -389,27 +399,88 @@ point. Output only the words to be spoken.
     return prompt.strip()
 
 
+def create_language_roles_block(
+    primary_language: str = "English",
+    complementary_languages: Optional[List[str]] = None,
+    audience: str = "pair"
+) -> str:
+    """
+    Builds the `language_learning` language-role instruction block (REQ-17, TASK-3.4).
+
+    Algorithm:
+    1. Name the primary language, which anchors explanations, instructions, corrections.
+    2. Name each peer's own target language as complementary, carrying the vocabulary,
+       idiom callouts, corrected phrases, and quiz/note content.
+    3. State explicitly that primary does not mean only.
+
+    The two peers in a tandem pair rarely share a native language - a Hindi speaker
+    learning Japanese paired with a Japanese speaker learning Hindi - so scaffolding
+    written in one peer's target language is unintelligible to the other. English is the
+    one language both reliably read, which is why it anchors rather than replaces.
+
+    Step 3 is not padding. Told only "primary language: English", a model reads it as
+    permission to drop the target language altogether, and the practice the session
+    exists for quietly stops happening.
+
+    `audience="solo"` drops every reference to a second person. The 1:1 Convo AI path has
+    exactly one human in the channel, and a prompt that mentions peers there produces an
+    agent that faithfully addresses somebody who is not present (REQ-LLM-03).
+    """
+    complementary = [lang for lang in (complementary_languages or []) if lang]
+    complementary_str = ", ".join(complementary) if complementary else "none"
+
+    if audience == "solo":
+        reach = (f"Write every explanation, instruction, and correction in "
+                 f"{primary_language}, so the student understands it whatever their "
+                 f"own first language is.")
+    else:
+        reach = (f"Write every explanation, instruction, and correction in "
+                 f"{primary_language}, so it is understood regardless of which language "
+                 f"is native to whom.")
+
+    return f"""Primary Language: {primary_language}
+Complementary Languages: {complementary_str}
+
+LANGUAGE ROLES:
+- {reach}
+- Carry vocabulary highlights, idiom and cultural callouts, corrected phrases, and
+  quiz/note content in the complementary language each item belongs to
+  ({complementary_str}), so target-language production and practice continue.
+- {primary_language}-primary is NOT English-only: a turn with no complementary-language
+  content in it has failed to teach anything."""
+
+
 def create_teaching_prompt(
     recent_context: str,
     speaker_stats: Dict[str, Any],
     target_language: str = "Japanese",
     native_language: str = "English",
-    topic: Optional[str] = None
+    topic: Optional[str] = None,
+    primary_language: str = "English",
+    complementary_languages: Optional[List[str]] = None
 ) -> str:
     """
     Constructs an LLM prompt incorporating live dialogue context, speaker stats, and pedagogical goals.
-    
+
     Algorithm:
     1. Format speaker speaking-time distributions and turn statistics into readable metrics.
     2. Incorporate recent multi-speaker dialogue context.
-    3. Include active conversational topic and target/native language pairing.
+    3. Include active conversational topic and the REQ-17 language roles.
     4. Instruct the LLM to analyze the latest turn and output structured JSON response.
+
+    `complementary_languages` defaults to the single configured `target_language`, so a
+    caller predating the peer-pair roles (TASK-3.4) gets the same lesson it always did.
     """
     stats_summary = ", ".join(f"{spk}: {pct}%" for spk, pct in speaker_stats.items()) if speaker_stats else "Equal distribution"
     topic_str = f"Current Discussion Topic: {topic}\n" if topic else ""
+    roles = create_language_roles_block(
+        primary_language=primary_language,
+        complementary_languages=complementary_languages or [target_language]
+    )
 
     prompt = f"""
-{topic_str}Target Language: {target_language}
+{topic_str}{roles}
+Target Language: {target_language}
 Native Language: {native_language}
 Speaker Balance Metrics: {stats_summary}
 

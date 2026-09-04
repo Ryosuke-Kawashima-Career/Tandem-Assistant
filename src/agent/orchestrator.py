@@ -92,21 +92,33 @@ class TeachingAgent:
         openai_api_key: Optional[str] = None,
         gemini_api_key: Optional[str] = None,
         target_language: str = "Japanese",
-        native_language: str = "English"
+        native_language: str = "English",
+        primary_language: str = "English",
+        peer_target_languages: Optional[Dict[str, str]] = None
     ):
         """
         Initialize the TeachingAgent with configuration and client credentials.
-        
+
         Algorithm:
         1. Resolve API credentials from arguments or environment variables.
         2. Initialize provider SDK clients (OpenAI or Google Gemini).
         3. Initialize turn history buffer and speaker duration tracking tables.
         4. Configure default target and native languages.
+        5. Configure the REQ-17 language roles: one primary language for scaffolding,
+           plus each peer's own target language as a complementary language.
+
+        `peer_target_languages` maps a speaker id to the language that speaker is
+        learning. A tandem pair holds two different ones - a Hindi speaker learning
+        Japanese alongside a Japanese speaker learning Hindi - which the single
+        `target_language` above cannot express, and picking either one of them makes the
+        agent's own explanations unintelligible to the other peer (REQ-17, TASK-3.4).
         """
         self.engine = engine.lower()
         self.target_language = target_language
         self.native_language = native_language
-        
+        self.primary_language = primary_language
+        self.peer_target_languages: Dict[str, str] = dict(peer_target_languages or {})
+
         self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
 
@@ -232,6 +244,48 @@ class TeachingAgent:
         recent = self.turn_history[-max_turns:]
         return "\n".join(f"[{item['speaker']} ({item['lang']})]: {item['text']}" for item in recent)
 
+    def set_peer_target_language(self, speaker_id: str, language: str) -> None:
+        """
+        Records which language one peer is learning (REQ-17, TASK-3.4).
+
+        Available per turn because a pairing is often only known once both peers have
+        actually joined and spoken; requiring it at construction time would mean tearing
+        down and rebuilding the agent - and its conversation history - mid-session.
+        """
+        if speaker_id and language:
+            self.peer_target_languages[speaker_id] = language
+
+    def complementary_languages(self) -> List[str]:
+        """
+        Returns each peer's own target language, in first-seen order, without duplicates.
+
+        Falls back to the single configured `target_language` so an agent constructed the
+        old way still has exactly one complementary language and behaves as it did.
+        """
+        languages: List[str] = []
+        for language in self.peer_target_languages.values():
+            if language and language not in languages:
+                languages.append(language)
+        return languages or [self.target_language]
+
+    def build_mediation_prompt(self, topic: Optional[str] = None) -> str:
+        """
+        Builds the ambient peer-mediation prompt under the REQ-17 language roles.
+
+        Extracted from `process_turn` so the roles are applied in exactly one place: the
+        prompt is also built by the Convo AI scaffolding path, and two call sites
+        assembling it independently is how one of them ends up without the roles.
+        """
+        return create_teaching_prompt(
+            recent_context=self.format_history_context(),
+            speaker_stats=self.get_speaker_balance_percentages(),
+            target_language=self.target_language,
+            native_language=self.native_language,
+            topic=topic,
+            primary_language=self.primary_language,
+            complementary_languages=self.complementary_languages()
+        )
+
     def resolve_tutor_target_language(self, detected_language: str) -> str:
         """
         Resolves the language a 1:1 tutor turn should teach.
@@ -256,12 +310,17 @@ class TeachingAgent:
         topic: Optional[str] = None
     ) -> str:
         """Builds the structured 1:1 scaffolding prompt for the session's language."""
+        target_language = self.peer_target_languages.get(
+            speaker_id, self.resolve_tutor_target_language(detected_language)
+        )
         return create_tutor_prompt(
             recent_context=self.format_history_context(),
-            target_language=self.resolve_tutor_target_language(detected_language),
+            target_language=target_language,
             native_language=self.native_language,
             learner_name=speaker_id,
-            topic=topic
+            topic=topic,
+            primary_language=self.primary_language,
+            complementary_languages=[target_language]
         )
 
     def build_tutor_voice_prompt(
@@ -410,13 +469,7 @@ class TeachingAgent:
             )
             system_prompt = SYSTEM_PROMPT_TANDEM_TUTOR
         else:
-            prompt = create_teaching_prompt(
-                recent_context=context_str,
-                speaker_stats=stats,
-                target_language=self.target_language,
-                native_language=self.native_language,
-                topic=topic
-            )
+            prompt = self.build_mediation_prompt(topic=topic)
             system_prompt = SYSTEM_PROMPT_TANDEM_TEACHER
 
         # Step 4: Dispatch to LLM

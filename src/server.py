@@ -45,7 +45,8 @@ from src.artifacts.generator import ArtifactGenerator
 from src.artifacts.models import TranscriptTurn
 from src.artifacts.repository import LocalArtifactRepository, configured_retention_days
 from src.sessions.models import InvalidSessionModeError, SessionMode, SessionRecord
-from src.sessions.service import SessionService
+from src.sessions.service import SessionNotFoundError, SessionService
+from src.translation.router import Participant, TranslationRouter
 from src.rtc.convoai_client import (
     ConvoAIClient,
     AGENT_STATUS_FAILED,
@@ -146,6 +147,11 @@ class EchoSphereServer:
         if purged:
             logger.info("Retention purge removed %d stored session artifact(s).", purged)
 
+        # Gemini Live Translate legs, one router per channel (REQ-17). Kept per channel
+        # rather than on the server because the topology is derived from a session's mode
+        # and its participant list, both of which are per channel.
+        self.translation_routers: Dict[str, TranslationRouter] = {}
+
         self.is_active = False
 
         # Step 5: Per-channel Convo AI session context (REQ-LLM-02).
@@ -162,6 +168,71 @@ class EchoSphereServer:
         logger.info(
             f"EchoSphereServer initialized for channel '{channel_name}' "
             f"(engine: {engine}, agent engine: {self.agent.engine})."
+        )
+
+    # -- Gemini Live Translate legs (REQ-17) ---------------------------------------
+
+    def start_translation(
+        self,
+        channel: str,
+        participants: List[Dict[str, Any]]
+    ) -> TranslationRouter:
+        """
+        Starts (or restarts) the translation legs for a channel (TASK-11.3 / 11.6).
+
+        Algorithm:
+        1. Require the channel's session - the mode decides the whole leg topology.
+        2. Close any router already on the channel, so a participant list change
+           replaces the legs rather than layering a second set on top of them.
+        3. Build a router wired to this server's data stream, and start it. Startup never
+           raises: legs that cannot reach Gemini report `unavailable` and the session
+           carries on without translated audio.
+
+        Raises:
+            SessionNotFoundError: the channel has no session to derive a mode from.
+        """
+        session = self.sessions.require_session(channel)
+        self.stop_translation(channel)
+
+        router = TranslationRouter(
+            session=session,
+            data_stream=self.data_stream,
+            transcript_sink=self._ingest_translation_transcript,
+        )
+        router.start([
+            Participant(
+                participant_id=str(entry.get("participant_id") or entry.get("uid") or ""),
+                language=str(entry.get("language") or "en"),
+            )
+            for entry in participants
+            if entry.get("participant_id") or entry.get("uid")
+        ])
+
+        self.translation_routers[channel] = router
+        return router
+
+    def stop_translation(self, channel: str) -> bool:
+        """Closes and forgets a channel's translation legs. Safe on an unknown channel."""
+        router = self.translation_routers.pop(channel, None)
+        if router is None:
+            return False
+        router.stop()
+        return True
+
+    def _ingest_translation_transcript(self, payload: Dict[str, Any]) -> None:
+        """
+        Feeds one finalized translation input transcript into the artifact pipeline.
+
+        Deliberately narrow: the router has already deduplicated, so this must not
+        re-check, and it must not block - it runs on whatever thread delivered the
+        transcript, which in a live session is the leg's read loop.
+        """
+        text = (payload.get("text") or "").strip()
+        if not text:
+            return
+        logger.debug(
+            "Finalized translation transcript on leg %s (%s).",
+            payload.get("leg_id"), payload.get("speaker_id")
         )
 
     def register_convoai_session(
@@ -775,6 +846,10 @@ def api_stop_session():
     data = request.get_json(silent=True) or {}
     channel = data.get("channel", server_instance.channel_name)
 
+    # REQ-17: the legs belong to the session, so they close with it. Left open, each one
+    # holds a Gemini WebSocket for a channel nobody is in any more.
+    server_instance.stop_translation(channel)
+
     closed = server_instance.sessions.end_session(channel)
     if closed is not None:
         # Stamp `ended_at` on the stored artifact; the artifact outlives the session.
@@ -829,6 +904,121 @@ def api_process_turn():
         channel=data.get("channel")
     )
     return jsonify({"success": True, "result": result}), 200
+
+
+# ------------------------------------------------------------------------------
+# Gemini Live Bidirectional Translation (REQ-17)
+# ------------------------------------------------------------------------------
+@app.route("/api/translation/start", methods=["POST"])
+def api_translation_start():
+    """
+    Starts the channel's Gemini Live Translate legs (TASK-11.3 / 11.6).
+
+    Always 200 once the session exists, even when every leg is unavailable: translation
+    being down is a degraded session, not a failed one, and returning an error here would
+    hand the client a reason to abandon a voice call that is working perfectly well.
+    """
+    data = request.get_json(silent=True) or {}
+    channel = data.get("channel", server_instance.channel_name)
+
+    try:
+        router = server_instance.start_translation(
+            channel=channel,
+            participants=data.get("participants") or []
+        )
+    except SessionNotFoundError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 404
+
+    return jsonify({
+        "success": True,
+        "channel": channel,
+        "mode": router.session.mode.value,
+        "available": router.is_available,
+        "legs": router.leg_states(),
+        "translated_audio": router.audio_gate_states(),
+    }), 200
+
+
+@app.route("/api/translation/stop", methods=["POST"])
+def api_translation_stop():
+    """Closes the channel's translation legs (session stop or participant departure)."""
+    data = request.get_json(silent=True) or {}
+    channel = data.get("channel", server_instance.channel_name)
+
+    stopped = server_instance.stop_translation(channel)
+    return jsonify({"success": True, "channel": channel, "stopped": stopped}), 200
+
+
+@app.route("/api/translation/status", methods=["GET"])
+def api_translation_status():
+    """
+    Reports leg states and the per-participant translated-audio gate (REQ-17).
+
+    A channel with no router reports empty rather than 404: "no translation running" is a
+    legitimate steady state, and the REQ-06 control needs an answer either way.
+    """
+    channel = request.args.get("channel", server_instance.channel_name)
+    router = server_instance.translation_routers.get(channel)
+
+    if router is None:
+        session = server_instance.sessions.get_session(channel)
+        return jsonify({
+            "success": True,
+            "channel": channel,
+            "mode": session.mode.value if session else None,
+            "available": False,
+            "legs": {},
+            "translated_audio": {},
+        }), 200
+
+    return jsonify({
+        "success": True,
+        "channel": channel,
+        "mode": router.session.mode.value,
+        "available": router.is_available,
+        "legs": router.leg_states(),
+        "translated_audio": router.audio_gate_states(),
+    }), 200
+
+
+@app.route("/api/translation/audio", methods=["POST"])
+def api_translation_audio_gate():
+    """
+    Flips one participant's translated-audio gate (TASK-11.5, REQ-06 controls).
+
+    The gate is server-side because the router decides who is published to. A client-side
+    mute would keep paying for the track and would leave two clients on the same leg
+    disagreeing about whether anyone is hearing it.
+
+    Transcripts are deliberately outside this gate: they still feed `TeachingAgent` and
+    the artifacts, and stay available as an on-demand subtitle.
+    """
+    data = request.get_json(silent=True) or {}
+    channel = data.get("channel", server_instance.channel_name)
+    participant_id = (data.get("participant_id") or "").strip()
+
+    if not participant_id:
+        return jsonify({
+            "success": False,
+            "error": "participant_id is required to set the translated-audio gate."
+        }), 400
+
+    router = server_instance.translation_routers.get(channel)
+    if router is None:
+        return jsonify({
+            "success": False,
+            "error": f"No translation legs running on channel '{channel}'."
+        }), 404
+
+    enabled = router.set_translated_audio_enabled(
+        participant_id, bool(data.get("enabled", False))
+    )
+    return jsonify({
+        "success": True,
+        "channel": channel,
+        "participant_id": participant_id,
+        "translated_audio_enabled": enabled,
+    }), 200
 
 
 @app.route("/api/rtc/token", methods=["GET"])

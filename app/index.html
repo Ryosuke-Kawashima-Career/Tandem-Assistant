@@ -62,6 +62,15 @@
           <option value="hi">🇮🇳 Hindi</option>
         </select>
 
+        <!-- REQ-17: per-participant translated-audio gate. Defaults on for
+             international work and off for language learning; transcripts publish
+             either way. -->
+        <button class="macos-action-btn" id="btn-translated-audio" aria-pressed="false"
+                title="Play Gemini Live translated audio of the other participants">
+          <span id="btn-translated-audio-icon">🌐</span>
+          <span id="btn-translated-audio-text">Translated Audio: Off</span>
+        </button>
+
         <div style="width: 1px; height: 18px; background: var(--macos-border-subtle); margin: 0 4px;"></div>
 
         <button class="macos-action-btn" id="btn-simulation" title="Run realistic tri-lingual dialogue simulation">

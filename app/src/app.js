@@ -63,6 +63,14 @@ class TandemApp {
     // conversation is impossible without this, so it gates startConvoAI().
     this.hasLiveAudio = false;
 
+    // Gemini Live translated audio (REQ-17). Defaults per mode - on for international
+    // work, off for language learning - and is re-derived whenever the mode changes,
+    // until the participant makes a choice of their own. The server owns the real gate;
+    // this only mirrors it, because the router decides who is published to.
+    this.translatedAudioEnabled = false;
+    this.translatedAudioChosen = false;
+    this.translationLegs = {};
+
     // Live transcripts and agent state, delivered over RTM by the Convo AI Engine
     this.transcriptService = new ConvoAITranscriptService();
     this.rtcCredentials = null;
@@ -177,6 +185,63 @@ class TandemApp {
     this.streamManager.on('note.deleted', (payload) => {
       this.notesPanel.remove(payload);
     });
+
+    // Gemini Live Translate (REQ-17). Status carries either a leg's state or one
+    // participant's audio-gate state; transcripts arrive whatever the gate says, which
+    // is what keeps them usable as an on-demand subtitle.
+    this.streamManager.on('translation.status', (payload) => {
+      this.handleTranslationStatus(payload);
+    });
+
+    this.streamManager.on('translation.output_transcript', (payload) => {
+      this.handleTranslationTranscript(payload);
+    });
+  }
+
+  /**
+   * Reflects a translation status event in the toolbar (REQ-17).
+   *
+   * Two shapes share the event: a leg state (`active`, `degraded`, `unavailable`) and
+   * this participant's audio gate. Only the gate for *this* participant may move the
+   * toggle - another participant's choice is theirs, and mirroring it here is how two
+   * clients end up fighting over one control.
+   */
+  handleTranslationStatus(payload) {
+    if (!payload) return;
+
+    if (payload.state === 'audio_gate') {
+      if (payload.participant_id === this.speakerId) {
+        this.translatedAudioEnabled = Boolean(payload.translated_audio_enabled);
+        this.updateTranslatedAudioUi();
+      }
+      return;
+    }
+
+    if (payload.state === 'unavailable') {
+      console.warn(
+        `🌐 Translation leg ${payload.leg_id} unavailable: ${payload.reason || 'no reason given'}. `
+        + 'The call continues without translated audio.'
+      );
+    }
+    this.translationLegs = { ...(this.translationLegs || {}), [payload.leg_id]: payload.state };
+  }
+
+  /**
+   * Renders a translated utterance as a subtitle line (REQ-17 / REQ-06).
+   *
+   * Plain source/target text only. Transliteration and register-aware phrasing stay with
+   * the ASR -> TeachingAgent subtitle pipeline, so the two never disagree on screen.
+   */
+  handleTranslationTranscript(payload) {
+    if (!payload?.text || !payload.is_final) return;
+    this.subtitles.addSubtitle({
+      speaker: `${payload.speaker_id} → ${payload.target_language}`,
+      original_text: payload.text,
+      transliteration: '',
+      translation_en: '',
+      translation_ja: '',
+      translation_hi: ''
+    });
   }
 
   /**
@@ -239,6 +304,118 @@ class TandemApp {
 
     this.teacherBar.setVisible(isLearning && this.isAiActive);
     document.body.dataset.sessionMode = this.currentMode;
+
+    // REQ-17: the mode supplies the default until the participant chooses for
+    // themselves. Overriding an explicit choice on a mode switch would silently undo it.
+    if (!this.translatedAudioChosen) {
+      this.translatedAudioEnabled = !isLearning;
+      this.updateTranslatedAudioUi();
+    }
+  }
+
+  /**
+   * Turns this participant's translated audio on or off (REQ-17, REQ-06 controls).
+   *
+   * Algorithm:
+   * 1. Record that the choice is now explicit, so a later mode switch leaves it alone.
+   * 2. Flip the local mirror and repaint immediately - the control must feel instant.
+   * 3. Ask the server to move the real gate; on failure, roll the mirror back rather
+   *    than leaving the button claiming a state the router does not have.
+   */
+  async toggleTranslatedAudio() {
+    const next = !this.translatedAudioEnabled;
+    this.translatedAudioChosen = true;
+    this.translatedAudioEnabled = next;
+    this.updateTranslatedAudioUi();
+
+    try {
+      const body = await requestJson('/api/translation/audio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          channel: this.channelName,
+          participant_id: this.speakerId,
+          enabled: next
+        })
+      });
+      this.translatedAudioEnabled = Boolean(body.translated_audio_enabled);
+    } catch (err) {
+      console.warn('🌐 Could not change the translated-audio gate:', err.message);
+      this.translatedAudioEnabled = !next;
+    }
+    this.updateTranslatedAudioUi();
+  }
+
+  /**
+   * Starts this channel's Gemini Live Translate legs (REQ-17).
+   *
+   * Algorithm:
+   * 1. Describe the room: this participant in the selected language, plus every remote
+   *    participant already publishing audio.
+   * 2. Ask the backend to plan and connect the legs for the session's mode.
+   * 3. Adopt the gate state the server reports for this participant, since the mode
+   *    default lives there rather than here.
+   *
+   * A failure is logged, not surfaced: translation being unavailable is a degraded call,
+   * not a broken one, and the voice conversation is already running by this point.
+   */
+  async startTranslationLegs() {
+    const language = document.getElementById('convoai-language')?.value || 'en';
+    const participants = [{ participant_id: this.speakerId, language }];
+    this.remoteAudioTracks.forEach((_track, uid) => {
+      participants.push({ participant_id: String(uid), language: 'en' });
+    });
+
+    try {
+      const body = await requestJson('/api/translation/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel: this.channelName, participants })
+      });
+
+      this.translationLegs = body.legs || {};
+      if (!this.translatedAudioChosen && this.speakerId in (body.translated_audio || {})) {
+        this.translatedAudioEnabled = Boolean(body.translated_audio[this.speakerId]);
+        this.updateTranslatedAudioUi();
+      }
+      if (!body.available) {
+        console.warn('🌐 Live Translate is unavailable; the session continues without '
+          + 'translated audio. Transcripts are unaffected.');
+      }
+    } catch (err) {
+      console.warn('🌐 Could not start the translation legs:', err.message);
+    }
+  }
+
+  /**
+   * Closes this channel's translation legs when the conversation ends (REQ-17).
+   */
+  async stopTranslationLegs() {
+    try {
+      await requestJson('/api/translation/stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel: this.channelName })
+      });
+    } catch (err) {
+      console.warn('🌐 Could not stop the translation legs:', err.message);
+    }
+    this.translationLegs = {};
+  }
+
+  /**
+   * Repaints the translated-audio control from the current gate state.
+   */
+  updateTranslatedAudioUi() {
+    const btn = document.getElementById('btn-translated-audio');
+    const text = document.getElementById('btn-translated-audio-text');
+    const on = Boolean(this.translatedAudioEnabled);
+
+    if (text) text.textContent = `Translated Audio: ${on ? 'On' : 'Off'}`;
+    if (btn) {
+      btn.classList.toggle('active', on);
+      btn.setAttribute('aria-pressed', String(on));
+    }
   }
 
   /**
@@ -312,6 +489,13 @@ class TandemApp {
     if (btnMic) {
       btnMic.addEventListener('click', () => this.toggleMicrophone());
     }
+
+    // Gemini Live translated audio (REQ-17), alongside the other direct-AI controls
+    const btnTranslatedAudio = document.getElementById('btn-translated-audio');
+    if (btnTranslatedAudio) {
+      btnTranslatedAudio.addEventListener('click', () => this.toggleTranslatedAudio());
+    }
+    this.updateTranslatedAudioUi();
 
     // Convo AI: direct spoken conversation with the AI co-teacher (REQ-09)
     const btnConvoAI = document.getElementById('btn-convoai');
@@ -721,6 +905,11 @@ class TandemApp {
       const agent = await this.convoai.startAgent(language, this.currentMode, this.speakerId);
       console.log('🤖 Convo AI agent accepted:', agent);
 
+      // REQ-17: the legs are started after the session exists, since the session's mode
+      // is what decides the topology. Not awaited into the agent's critical path - a
+      // slow Gemini handshake must not delay the voice the learner is waiting for.
+      this.startTranslationLegs();
+
       // Step 5: A simulated agent never produces a 'user-joined' event
       if (agent.simulated) {
         this.markAiLive();
@@ -759,6 +948,7 @@ class TandemApp {
     }
 
     await this.convoai.stopAgent();
+    await this.stopTranslationLegs();
     this.isAiActive = false;
     this.isAiPending = false;
     // The session is over, so its mode is no longer binding: the next one may differ.

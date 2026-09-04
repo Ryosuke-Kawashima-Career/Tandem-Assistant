@@ -180,6 +180,21 @@ class DataStreamManager:
         """
         return self._dispatch(event_type, payload)
 
+    def send_translation_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
+        """
+        Broadcasts a Gemini Live Translate event (REQ-17): `translation.status`,
+        `translation.input_transcript`, `translation.output_transcript`.
+
+        Algorithm:
+        1. Accept an already-enveloped payload (schema version, session, mode, leg id).
+        2. Forward it unchanged to _dispatch under the given event type.
+
+        Enveloped by `TranslationRouter` rather than here for the same reason artifact
+        events are: the leg id, sequence, and session are what a receiver orders and
+        deduplicates by, and only the router knows them.
+        """
+        return self._dispatch(event_type, payload)
+
     def send_speaking_balance(self, speaker_stats: Dict[str, int]) -> bool:
         """
         Broadcasts real-time speaking time percentage metrics to the classroom UI.

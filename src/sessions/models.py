@@ -109,6 +109,20 @@ class SessionMode(str, Enum):
         return ("term", "decision", "action", "risk", "open_question", "glossary")
 
     @property
+    def translated_audio_default(self) -> bool:
+        """
+        Whether Gemini Live translated audio plays by default for this mode (REQ-17).
+
+        On for `international_work`: understanding each other is the point of the call,
+        and making every participant switch it on individually is friction with no
+        upside. Off for `language_learning`: a learner handed a fluent translation of
+        their partner stops parsing the target language, which is the one thing the
+        session exists to make them do. Either default is overridable per participant
+        from the REQ-06 direct-AI controls; only the *default* lives here.
+        """
+        return self is SessionMode.INTERNATIONAL_WORK
+
+    @property
     def label(self) -> str:
         """Human-readable name for logs and UI copy."""
         return "Language Learning" if self.grades_language else "International Work"
