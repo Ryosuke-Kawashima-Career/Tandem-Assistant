@@ -27,6 +27,7 @@ Key Classes:
     - Participant: who is in the session and what language they speak.
 """
 
+import functools
 import logging
 import threading
 import time
@@ -222,6 +223,15 @@ class TranslationRouter:
 
             self._states[config.leg_id] = state if isinstance(state, LegState) else LegState.ACTIVE
             self._emit_status(config.leg_id, reason=reason)
+
+            # TASK-11.8: a connected leg starts producing translated audio and
+            # transcripts only once something drains its socket. Without this, the wire
+            # contract fixed in v1.13.1 has nothing to deliver it - every event Gemini
+            # sends would sit unread until the leg's own send-side timeout gave up on it.
+            if self._states[config.leg_id] is LegState.ACTIVE:
+                start_reader = getattr(self._sessions.get(config.leg_id), "start_reader", None)
+                if start_reader is not None:
+                    start_reader(functools.partial(self._on_leg_event, config.leg_id))
 
         return self.leg_states()
 
@@ -546,6 +556,39 @@ class TranslationRouter:
             "text": text,
             "is_final": bool(is_final),
         }
+
+    def _on_leg_event(self, leg_id: str, event: Dict[str, Any]) -> None:
+        """
+        Dispatches one event a leg's reader produced to the matching handler (TASK-11.8).
+
+        Algorithm:
+        1. `audio` -> `handle_translated_audio`, gated by the recipient audio toggle.
+        2. `input_transcript` / `output_transcript` -> the matching transcript handler,
+           carrying `is_final` through so once-only ingestion still applies.
+        3. `leg_state_changed` -> reconcile the router's own leg-health bookkeeping with
+           what the leg discovered on its own: `active` recovers it, anything else
+           degrades it. Without this, a leg whose reader died from a read failure - or
+           came back after a reconnect - would leave the router's `_states` entry stale,
+           silently gating routing/publication off (or on) forever after.
+
+        Runs on whichever leg's reader thread produced the event; every handler this
+        calls already synchronizes its own shared state (`self._lock`), so this method
+        itself holds nothing.
+        """
+        event_type = event.get("type")
+        if event_type == "audio":
+            self.handle_translated_audio(leg_id, event.get("audio", b""))
+        elif event_type == "input_transcript":
+            self.handle_input_transcript(leg_id, event.get("text", ""),
+                                         is_final=bool(event.get("is_final")))
+        elif event_type == "output_transcript":
+            self.handle_output_transcript(leg_id, event.get("text", ""),
+                                          is_final=bool(event.get("is_final")))
+        elif event_type == "leg_state_changed":
+            if event.get("state") == LegState.ACTIVE.value:
+                self.recover_leg(leg_id)
+            else:
+                self.degrade_leg(leg_id, reason=event.get("reason", ""))
 
     def _emit_status(
         self,

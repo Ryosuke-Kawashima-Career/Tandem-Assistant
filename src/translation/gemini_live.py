@@ -31,6 +31,7 @@ import binascii
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -271,6 +272,13 @@ class GeminiLiveTranslateSession:
         self.unavailable_reason = ""
         self.reconnect_count = 0
 
+        # Full-duplex reader (REQ-17, TASK-11.8). `_on_event` is retained across a
+        # reconnect specifically so `_ensure_reader_running` can resume streaming on the
+        # new socket without the caller having to call `start_reader` a second time.
+        self._on_event: Optional[Callable[[Dict[str, Any]], None]] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_stop = threading.Event()
+
     # -- Wire contract -------------------------------------------------------------
 
     def build_setup_message(self) -> Dict[str, Any]:
@@ -368,15 +376,33 @@ class GeminiLiveTranslateSession:
         3. On a transport error, re-establish the socket and retry once; if that fails
            too, mark the leg degraded and return False. The router keeps the other legs
            and the original Agora audio running either way.
+        4. On success, resume the reader if a reconnect just replaced the socket out from
+           under it - `_reconnect()` closes the old connection, which is exactly what
+           unblocks a reader thread parked in `receive()` on it, so that thread has
+           already exited by the time step 4 runs. Without this, one transient drop
+           would permanently end the leg's translated audio and transcripts even though
+           sending itself recovered (TASK-11.8).
+
+        Runs independently of the reader: this method only ever touches the socket's
+        send half, so a leg accepts new audio while its own reader is mid-`recv()` on
+        the same socket - the send and receive halves of a WebSocket are independent.
         """
         if self.state in (LegState.CLOSED, LegState.UNAVAILABLE) or self._connection is None:
             return False
 
         message = json.dumps(self.build_audio_message(chunk))
+        reconnected = False
         for attempt in range(self.max_reconnect_attempts + 1):
             try:
                 self._connection.send(message)
                 self.state = LegState.ACTIVE
+                if reconnected:
+                    self._resume_reader_after_reconnect()
+                    self._notify_event({
+                        "type": "leg_state_changed",
+                        "state": LegState.ACTIVE.value,
+                        "reason": "reconnected",
+                    })
                 return True
             except Exception as error:  # noqa: BLE001 - transport-level, recoverable
                 logger.warning(
@@ -386,6 +412,7 @@ class GeminiLiveTranslateSession:
                 if attempt >= self.max_reconnect_attempts or not self._reconnect():
                     self.state = LegState.DEGRADED
                     return False
+                reconnected = True
         return False
 
     def receive(self) -> List[Dict[str, Any]]:
@@ -394,22 +421,79 @@ class GeminiLiveTranslateSession:
 
         Returns an empty list rather than blocking forever or raising when the socket is
         not readable: the caller is a routing loop, not an error handler.
+
+        Snapshots `self._connection` into a local before the blocking call: this method
+        runs on the reader thread while `close()`/`_reconnect()` run on whatever thread
+        called `send_audio()`, and either can null out or replace `self._connection`
+        while this call is parked in `.recv()`. Reading the attribute twice would let
+        that swap turn a blocking call into an `AttributeError` on `None` instead of the
+        clean "socket closed" exception the local reference still raises.
         """
-        if self._connection is None or self.state is not LegState.ACTIVE:
+        connection = self._connection
+        if connection is None or self.state is not LegState.ACTIVE:
             return []
         try:
-            return parse_server_message(self._connection.recv())
+            return parse_server_message(connection.recv())
         except Exception as error:  # noqa: BLE001 - a read failure degrades this leg only
             logger.warning("Translation leg '%s' receive failed: %s",
                            self.config.leg_id, error)
             self.state = LegState.DEGRADED
             return []
 
+    def start_reader(self, on_event: Callable[[Dict[str, Any]], None]) -> bool:
+        """
+        Starts this leg's full-duplex reader (REQ-17, TASK-11.8).
+
+        Algorithm:
+        1. Refuse when the leg is not active, or a reader is already running - one
+           leg runs one reader.
+        2. Remember `on_event` so a later reconnect can restart the reader on the leg's
+           behalf without the caller calling this again.
+        3. Spawn a daemon thread draining `receive()` continuously and forwarding every
+           event to `on_event` as it arrives.
+
+        This is what makes the leg full-duplex in practice: `send_audio()` and this
+        reader run on independent threads over the same socket, so a translated
+        response can surface while the caller is still feeding this leg new audio -
+        never a blocking send-then-wait request/response (spec 1.11.0).
+        """
+        if self.state is not LegState.ACTIVE:
+            return False
+        if self._reader_thread is not None and self._reader_thread.is_alive():
+            return False
+
+        self._on_event = on_event
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            name=f"gemini-leg-reader-{self.config.leg_id}",
+            daemon=True
+        )
+        self._reader_thread.start()
+        return True
+
+    def stop_reader(self, timeout: float = 2.0) -> None:
+        """Signals the reader to stop and waits briefly for it to exit."""
+        self._reader_stop.set()
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=timeout)
+            self._reader_thread = None
+
     def close(self) -> None:
         """
         Closes the socket. Idempotent: a leg is closed on participant leave, on language
         change, and on session stop, and those can legitimately coincide.
+
+        Algorithm:
+        1. Signal the reader to stop before touching the socket, so a normal exit never
+           races the "did the socket just die on its own" path below.
+        2. Close the connection - this is what unblocks a reader thread parked in
+           `receive()`'s blocking read, not the stop signal alone.
+        3. Join the reader so a caller that awaits `close()` knows the thread is gone,
+           not still mid-callback against a leg the router is about to forget.
         """
+        self._reader_stop.set()
+
         if self._connection is not None:
             try:
                 self._connection.close()
@@ -417,9 +501,87 @@ class GeminiLiveTranslateSession:
                 logger.debug("Translation leg '%s' close raised: %s",
                              self.config.leg_id, error)
             self._connection = None
+
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=2.0)
+            self._reader_thread = None
+
         self.state = LegState.CLOSED
 
     # -- Internals -----------------------------------------------------------------
+
+    def _reader_loop(self) -> None:
+        """
+        The reader thread body: drains events until stopped or this leg leaves `active`.
+
+        Algorithm:
+        1. Loop while neither `stop_reader()` was called nor `receive()` moved the leg
+           out of `active` (a read failure sets `degraded` internally, which this same
+           condition catches without a separate check).
+        2. Forward every event from one `receive()` call before blocking on the next -
+           `receive()` already returns a whole decoded message's events together, so
+           this preserves the order Gemini emitted them in.
+        3. On exit, tell the router only when the leg died on its own: an explicit
+           `close()`/`stop_reader()` already means the router knows and is about to
+           forget this leg, so a status event at that point would just be noise about a
+           leg nobody is tracking any more.
+        """
+        while not self._reader_stop.is_set() and self.state is LegState.ACTIVE:
+            for event in self.receive():
+                if self._reader_stop.is_set():
+                    break
+                self._notify_event(event)
+
+        if not self._reader_stop.is_set():
+            self._notify_event({
+                "type": "leg_state_changed",
+                "state": self.state.value,
+                "reason": self.unavailable_reason or "read failed",
+            })
+
+    def _resume_reader_after_reconnect(self) -> None:
+        """
+        Restarts the reader on the new socket after `_reconnect()` replaced it
+        (TASK-11.8).
+
+        `_reconnect()` closes the old connection, and closing it is what unblocks a
+        reader thread parked in `receive()` on that connection - but that unblocking
+        happens on the reader's own thread, asynchronously with this one. A bare
+        `is_alive()` check here would race it: this method can run before the old
+        reader has actually finished exiting, and would then silently skip starting a
+        new one, leaving the leg with no reader at all despite `send_audio` reporting
+        success. Joining briefly (bounded, since the old connection is already closed
+        and the reader is already unblocking) closes that race.
+
+        Only called from the reconnect branch of `send_audio` - an ordinary send whose
+        reader is already running must never pay for a join here.
+
+        The join is also what makes `self.state` safe to reassert below: the dying
+        reader's own `receive()` sets it to `degraded` on its way out, and that write
+        happens on a different thread with no lock around `self.state`, so joining
+        first guarantees that write has already landed before this method's own
+        `ACTIVE` write - rather than racing it and losing.
+        """
+        if self._on_event is None:
+            return
+        if self._reader_thread is not None:
+            self._reader_thread.join(timeout=2.0)
+            self._reader_thread = None
+        # `send_audio` already confirmed the new connection is healthy; reassert ACTIVE
+        # so `start_reader`'s own-state check below does not refuse on the `degraded`
+        # the old reader just wrote while exiting.
+        self.state = LegState.ACTIVE
+        self.start_reader(self._on_event)
+
+    def _notify_event(self, event: Dict[str, Any]) -> None:
+        """Forwards one event to the registered callback, isolating its failures."""
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(event)
+        except Exception as error:  # noqa: BLE001 - one bad handler must not kill the reader
+            logger.error("Translation leg '%s' event handler failed: %s",
+                         self.config.leg_id, error)
 
     def _reconnect(self) -> bool:
         """Re-establishes the socket in place, preserving the leg's identity."""
