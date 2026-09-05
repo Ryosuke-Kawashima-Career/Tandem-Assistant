@@ -24,6 +24,7 @@ from src.rtc.convoai_client import (
     AGENT_STATUS_RUNNING,
     AGENT_STATUS_STOPPED,
 )
+from src.agent.tools.vision import CameraVisionTool
 from src.rtc.agora_client import is_usable_credential
 from src.server import app, server_instance, FALLBACK_REPLIES
 
@@ -1170,6 +1171,127 @@ class TestConvoAILatency(unittest.TestCase):
             timing_lines,
             f"expected a per-turn latency line, got: {captured.output}"
         )
+
+
+class TestConvoAICameraGrounding(unittest.TestCase):
+    """
+    Test suite for the live camera reaching the Convo AI turn (REQ-CAM-03, Phase 3).
+
+    Verified at the server seam rather than on the agent, because what this phase adds is
+    a wiring claim: the channel the learner is speaking on has to become the channel the
+    agent looks through, and the frame the browser pushed has to be the frame described.
+    """
+
+    VISION_RESPONSE = {
+        "candidates": [{
+            "content": {"parts": [{
+                "text": (
+                    "A ceramic teacup\n"
+                    "A small unglazed cup with a hand-painted rim."
+                )
+            }]}
+        }]
+    }
+
+    CHANNEL = "camera-convoai"
+
+    def setUp(self):
+        """A started session with a fake vision tool and an empty frame buffer."""
+        self.app = app.test_client()
+        server_instance.sessions.reset()
+        server_instance.artifacts.reset()
+        server_instance.camera_buffer.clear(self.CHANNEL)
+        self.original_vision = server_instance.tools.vision
+        self.transport = MagicMock(return_value=self.VISION_RESPONSE)
+        server_instance.tools.vision = CameraVisionTool(
+            api_key="test-key", transport=self.transport
+        )
+        self.app.post("/api/session/start", json={
+            "channel": self.CHANNEL, "mode": "language_learning",
+            "participants": ["Kenji"], "languages": ["ja"]
+        })
+
+    def tearDown(self):
+        """Restore the server's own tool and leave no frame buffered."""
+        server_instance.tools.vision = self.original_vision
+        server_instance.camera_buffer.clear(self.CHANNEL)
+
+    def push_frame(self):
+        """Buffers one frame the way the browser's periodic push does."""
+        server_instance.camera_buffer.put(self.CHANNEL, b"a frame", "image/jpeg")
+
+    def test_a_camera_question_on_a_channel_describes_the_pushed_frame(self):
+        """
+        Verify the spoken turn looks through the camera of the channel it is on.
+
+        This is the whole feature end to end on the server side: the browser pushed a
+        frame, the learner asked out loud, and nobody pressed a button.
+        """
+        self.push_frame()
+
+        reply = "".join(server_instance.stream_convoai_reply(
+            speaker_id="Kenji", text="What is this?", language="ja", channel=self.CHANNEL
+        ))
+
+        self.assertTrue(reply.strip())
+        self.assertEqual(self.transport.call_count, 1)
+
+    def test_a_turn_with_no_buffered_frame_never_calls_the_vendor(self):
+        """Verify the camera being off leaves the voice path exactly as it was."""
+        reply = "".join(server_instance.stream_convoai_reply(
+            speaker_id="Kenji", text="What is this?", language="ja", channel=self.CHANNEL
+        ))
+
+        self.assertTrue(reply.strip())
+        self.assertEqual(self.transport.call_count, 0)
+
+    def test_an_ordinary_turn_never_calls_the_vendor(self):
+        """
+        Verify the common case stays free (REQ-LAT-02).
+
+        Almost every utterance in a session is not about the camera, and none of them may
+        pay for a vision call to establish that.
+        """
+        self.push_frame()
+
+        server_instance.stream_convoai_reply(
+            speaker_id="Kenji", text="Yesterday I went to Kyoto.", language="ja",
+            channel=self.CHANNEL
+        )
+
+        self.assertEqual(self.transport.call_count, 0)
+
+    def test_the_scaffolding_pass_shares_the_spoken_turn_s_observation(self):
+        """
+        Verify the turn's notes are written about what was seen (Task 3.3).
+
+        The scaffolding call runs after the spoken reply against the same frame, so it
+        must reuse that description: one vendor call per frame, not one per reader.
+        """
+        self.push_frame()
+
+        "".join(server_instance.stream_convoai_reply(
+            speaker_id="Kenji", text="What is this?", language="ja", channel=self.CHANNEL
+        ))
+        server_instance.process_convoai_turn(
+            speaker_id="Kenji", text="What is this?", language="ja",
+            record_turn=False, channel=self.CHANNEL
+        )
+
+        self.assertEqual(self.transport.call_count, 1)
+
+    def test_ending_the_session_stops_the_agent_seeing(self):
+        """
+        Verify a buffered frame does not outlive the conversation it was pushed during.
+
+        Retention here is the same posture REQ-22 states for the button flow: a frame
+        exists for the moment it is being used, and not past it.
+        """
+        self.push_frame()
+
+        self.app.post("/api/session/stop", json={"channel": self.CHANNEL})
+
+        self.assertIsNone(server_instance.camera_buffer.get(self.CHANNEL))
 
 
 if __name__ == '__main__':

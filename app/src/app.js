@@ -40,6 +40,24 @@ const ARTIFACT_POLL_INTERVAL_MS = 5000;
 // a working camera. The device label is the only signal that does.
 const DECOY_CAMERA_PATTERN = /\b(ir|infrared|depth|virtual|mirametrix|obs|snap|droidcam)\b/i;
 
+// How often a frame is pushed for the agent to look at while Camera Assist is open
+// (REQ-CAM-01). Frequent enough that what the agent sees is what the participant is
+// currently holding up, infrequent enough to stay well clear of the live audio the call
+// depends on (REQ-LAT-01). It also has to stay comfortably inside the server's own
+// freshness window (CAMERA_FRAME_TTL_SECONDS, 15s), or a camera left open would keep
+// going briefly blind between pushes.
+const CAMERA_STREAM_INTERVAL_MS = 3000;
+
+// The longer edge of a pushed frame, in pixels. Deliberately a fraction of
+// captureCameraFrame()'s full-resolution capture: that one is a participant asking for
+// the best possible reading of a page, this one is a background push every few seconds
+// on a connection already carrying a voice call (Risk 5). It is still large enough for a
+// vision model to name an object and read reasonably sized text.
+const CAMERA_STREAM_MAX_EDGE = 640;
+
+// JPEG quality for those pushes, below the on-demand capture's 0.85 for the same reason.
+const CAMERA_STREAM_QUALITY = 0.7;
+
 class TandemApp {
   /**
    * Initialize Tandem Application.
@@ -90,6 +108,11 @@ class TandemApp {
     // taken on demand and uploaded as one frame, so nothing is recorded or held.
     this.cameraStream = null;
     this.isCameraOn = false;
+    // The periodic push that lets the co-teacher answer "what is this?" mid-conversation
+    // (REQ-CAM-01). It exists only between toggleCamera() on and stopCamera(): the
+    // interval is created there and cleared there, so a closed panel captures nothing.
+    this.cameraStreamHandle = null;
+    this.cameraPushInFlight = false;
     // The camera actually being shown (D-UIUX-4). Remembered across open/close so a
     // participant who had to correct the browser's choice only corrects it once.
     this.cameraDeviceId = null;
@@ -574,8 +597,103 @@ class TandemApp {
 
     await this.showCameraStream();
     this.isCameraOn = true;
+    this.startCameraStreaming();
     await this.populateCameraDevices();
     this.updateCameraUi();
+  }
+
+  /**
+   * Begins pushing reduced-resolution frames while the panel is open (REQ-CAM-01).
+   *
+   * This is what lets the co-teacher answer "what is this?" in the middle of a spoken
+   * turn: by the time the agent decides to look, a frame is already on the server, so
+   * looking costs no round trip back to this browser on the one path the learner waits
+   * on in silence (REQ-LAT-02).
+   *
+   * Strictly scoped to the participant's own opt-in: the interval starts here, when they
+   * turned Camera Assist on, and stopCamera() clears it. Nothing is captured, uploaded,
+   * or buffered outside that window.
+   */
+  startCameraStreaming() {
+    this.stopCameraStreaming(false);
+    this.pushCameraFrame();
+    this.cameraStreamHandle = setInterval(
+      () => this.pushCameraFrame(), CAMERA_STREAM_INTERVAL_MS
+    );
+  }
+
+  /**
+   * Stops the periodic push and, by default, tells the server to forget the last frame.
+   *
+   * The explicit forget matters: without it the buffered frame would stay describable
+   * until its own TTL ran out, so closing the panel would not immediately stop the agent
+   * from seeing - which is exactly what closing the panel means.
+   *
+   * @param {boolean} clearServer - Whether to ask the server to drop the buffered frame
+   */
+  stopCameraStreaming(clearServer = true) {
+    if (this.cameraStreamHandle) {
+      clearInterval(this.cameraStreamHandle);
+      this.cameraStreamHandle = null;
+    }
+    if (!clearServer) return;
+
+    const params = new URLSearchParams({ channel: this.channelName, actor: this.speakerId });
+    requestJson(`/api/session/camera/stream?${params.toString()}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channel: this.channelName, actor: this.speakerId, active: false
+      })
+    }).catch(() => {
+      // A failed clear is not worth a message: the frame expires on its own within
+      // seconds, and the panel is already closed.
+    });
+  }
+
+  /**
+   * Uploads one reduced-resolution frame for the agent to look at (REQ-CAM-01).
+   *
+   * Deliberately smaller than captureCameraFrame()'s full-resolution capture: this runs
+   * every few seconds on a connection already carrying a live voice call (Risk 5), while
+   * that one runs once, when a participant asked for the best possible reading of a page.
+   *
+   * Failures are silent by design. This is a background push nobody asked for; surfacing
+   * an error card for it would put a failure on screen for something the participant did
+   * not do, and the next push is three seconds away.
+   */
+  async pushCameraFrame() {
+    const video = document.getElementById('camera-preview');
+    if (!this.isCameraOn || !video?.videoWidth || this.cameraPushInFlight) return;
+
+    const scale = Math.min(
+      1, CAMERA_STREAM_MAX_EDGE / Math.max(video.videoWidth, video.videoHeight)
+    );
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    const blob = await new Promise(
+      (resolve) => canvas.toBlob(resolve, 'image/jpeg', CAMERA_STREAM_QUALITY)
+    );
+    if (!blob || !this.isCameraOn) return;
+
+    const form = new FormData();
+    form.append('image', blob, 'frame.jpg');
+
+    this.cameraPushInFlight = true;
+    try {
+      const params = new URLSearchParams({ channel: this.channelName, actor: this.speakerId });
+      await requestJson(`/api/session/camera/stream?${params.toString()}`, {
+        method: 'POST',
+        body: form
+      });
+    } catch (err) {
+      console.debug('📷 Camera frame push skipped:', err.message);
+    } finally {
+      this.cameraPushInFlight = false;
+    }
   }
 
   /**
@@ -716,10 +834,11 @@ class TandemApp {
     const panel = document.getElementById('camera-panel');
     const video = document.getElementById('camera-preview');
 
+    this.isCameraOn = false;
+    this.stopCameraStreaming();
     this.releaseCameraStream();
     if (video) video.srcObject = null;
     if (panel) panel.classList.add('hidden');
-    this.isCameraOn = false;
     this.updateCameraUi();
   }
 

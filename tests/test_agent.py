@@ -42,6 +42,7 @@ print(f'🔊 AI Spoken Response Synthesized: {len(spoken_audio)} bytes PCM')
 """
 
 import os
+import threading
 import unittest
 import json
 from unittest.mock import patch, MagicMock
@@ -49,7 +50,12 @@ from src.agent.orchestrator import (
     TeachingAgent,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_GEMINI_MODEL,
+    looks_like_camera_question,
 )
+from src.agent.tools.camera_stream import CameraFrameBuffer
+from src.agent.tools.dispatch import ToolDispatcher
+from src.agent.tools.vision import CameraVisionTool
+from src.sessions.models import SessionRecord
 from src.agent.prompts import (
     create_teaching_prompt,
     create_tutor_prompt,
@@ -666,6 +672,250 @@ class TestTutorSessionLanguage(unittest.TestCase):
         self.assertEqual(
             create_prompt.call_args[1]["target_language"], "Japanese"
         )
+
+
+class TestCameraQuestionDetection(unittest.TestCase):
+    """
+    Test suite for recognizing a camera-directed question (REQ-CAM-02, Phase 2).
+
+    This predicate runs on every single voice turn, so it is deliberately a regex list
+    rather than a model call - and deliberately narrow. Its job is not to be certain, it
+    is to be free: a false positive with the camera off costs nothing, because the second
+    gate (a fresh buffered frame) is what actually authorizes a vendor call.
+    """
+
+    CAMERA_QUESTIONS = [
+        "What is this?",
+        "what's this",
+        "What is that?",
+        "Hey, what are these?",
+        "What am I looking at?",
+        "what am i holding",
+        "Can you see this?",
+        "Could you read this for me?",
+        "Do you see that?",
+        "What does this say?",
+        "what do these mean",
+        "Look at this!",
+        "take a look at that",
+        "What is in front of me?",
+        "What is written here?",
+        "What kind of flower is this?",
+    ]
+
+    NOT_CAMERA_QUESTIONS = [
+        "",
+        "What is this word?",
+        "What is that expression you just used?",
+        "I went to the market yesterday.",
+        "Can you explain the difference between these two verbs I just said?",
+        "How do you say hello in Japanese?",
+        "That was hard to pronounce.",
+    ]
+
+    def test_camera_directed_phrasings_are_recognized(self):
+        """Verify the phrase list covers how a learner actually points at something."""
+        for text in self.CAMERA_QUESTIONS:
+            with self.subTest(text=text):
+                self.assertTrue(looks_like_camera_question(text))
+
+    def test_utterances_about_language_are_not_camera_questions(self):
+        """
+        Verify a question about a word is not read as a question about the room.
+
+        "What is this word?" is the near-miss that matters: it is asking about something
+        the learner just heard, and answering it by describing their desk would be an
+        answer to a question nobody asked.
+        """
+        for text in self.NOT_CAMERA_QUESTIONS:
+            with self.subTest(text=text):
+                self.assertFalse(looks_like_camera_question(text))
+
+    def test_detection_ignores_case_spacing_and_smart_quotes(self):
+        """Verify transcribed speech is matched however the ASR punctuated it."""
+        self.assertTrue(looks_like_camera_question("  WHAT'S   THIS?  "))
+        self.assertTrue(looks_like_camera_question("What’s this?"))
+
+
+class TestSpokenReplyCameraGrounding(unittest.TestCase):
+    """
+    Test suite for grounding a spoken reply in the live camera (REQ-CAM-03, Phase 3).
+
+    The contract under test is a latency contract as much as a correctness one: the
+    lookup happens only when the utterance points at something, only when a fresh frame
+    is buffered, and never for longer than its own bound - because everything here runs
+    while the learner is sitting in silence (REQ-LAT-02).
+    """
+
+    VISION_RESPONSE = {
+        "candidates": [{
+            "content": {"parts": [{
+                "text": (
+                    "A folding paper crane\n"
+                    "An origami crane in red paper, held up close to the lens."
+                )
+            }]}
+        }]
+    }
+
+    def setUp(self):
+        """An OpenAI-shaped agent whose prompt can be captured, over a live buffer."""
+        self.data_stream = MagicMock()
+        self.data_stream.send_tool_event.return_value = True
+        self.buffer = CameraFrameBuffer()
+        self.transport = MagicMock(return_value=self.VISION_RESPONSE)
+        self.tools = ToolDispatcher(
+            data_stream=self.data_stream,
+            vision=CameraVisionTool(api_key="test-key", transport=self.transport),
+            camera_buffer=self.buffer
+        )
+        self.session = SessionRecord.create(
+            channel="camera-voice", mode="language_learning",
+            languages=["ja"], participants=["Kenji"]
+        )
+
+        self.agent = TeachingAgent(engine="openai", openai_api_key="test-key", tools=self.tools)
+        self.agent.engine = "openai"
+        self.agent._openai_client = MagicMock()
+        self.agent._openai_client.chat.completions.create.side_effect = self.fake_stream
+
+    def fake_stream(self, *args, **kwargs):
+        """Replays two deltas so the reply completes without a real provider."""
+        for piece in ["I can see ", "it."]:
+            chunk = MagicMock()
+            chunk.choices = [MagicMock(delta=MagicMock(content=piece))]
+            yield chunk
+
+    def spoken_prompt(self):
+        """Returns the user prompt the provider was actually asked to answer."""
+        kwargs = self.agent._openai_client.chat.completions.create.call_args[1]
+        return kwargs["messages"][-1]["content"]
+
+    def reply(self, text="What is this?"):
+        """Runs one spoken turn over the live session and drains the stream."""
+        return "".join(self.agent.generate_spoken_reply(
+            speaker_id="Kenji", text=text, detected_language="ja",
+            session=self.session, channel="camera-voice"
+        ))
+
+    def cards(self):
+        """Returns the reference cards published during the turn."""
+        return [
+            call.args[1] for call in self.data_stream.send_tool_event.call_args_list
+            if call.args[0] == "reference.card"
+        ]
+
+    def test_a_camera_question_over_a_fresh_frame_grounds_the_prompt(self):
+        """
+        Verify what the camera saw reaches the model, and the card is drawn once.
+
+        One vendor call serves both: describing the frame twice - once to speak from,
+        once to draw - would double the cost of the one thing the learner waits on.
+        """
+        self.buffer.put("camera-voice", b"a frame")
+
+        self.assertTrue(self.reply().strip())
+
+        self.assertIn("origami crane", self.spoken_prompt())
+        self.assertEqual(self.transport.call_count, 1)
+        self.assertEqual(len(self.cards()), 1)
+        self.assertEqual(self.cards()[0]["card"]["requested_by"], "voice")
+
+    def test_without_a_buffered_frame_the_agent_is_told_it_cannot_see(self):
+        """
+        Verify the camera being off produces honesty, not a guess - and costs nothing.
+
+        No frame means no vendor call at all: this is the gate that keeps a camera-shaped
+        phrase from spending money on a camera nobody turned on (Risk 2).
+        """
+        self.assertTrue(self.reply().strip())
+
+        self.assertIn("no camera view", self.spoken_prompt())
+        self.assertEqual(self.transport.call_count, 0)
+        self.assertEqual(self.cards(), [])
+
+    def test_an_utterance_that_is_not_about_the_camera_is_left_alone(self):
+        """Verify an ordinary turn carries no camera context and pays nothing."""
+        self.buffer.put("camera-voice", b"a frame")
+
+        self.assertTrue(self.reply("I went to the market yesterday.").strip())
+
+        prompt = self.spoken_prompt()
+        self.assertNotIn("origami crane", prompt)
+        self.assertNotIn("no camera view", prompt)
+        self.assertEqual(self.transport.call_count, 0)
+
+    def test_a_lookup_that_times_out_still_produces_a_reply(self):
+        """
+        Verify a slow vendor degrades to a normal spoken reply (Risk 1).
+
+        The learner is waiting in silence and the Convo AI Engine's idle_timeout is
+        watching: a lookup that cannot finish in time has to be abandoned, not awaited.
+        """
+        released = threading.Event()
+        self.addCleanup(released.set)
+
+        def stalls(*args, **kwargs):
+            released.wait(30.0)
+            return self.VISION_RESPONSE
+
+        self.transport.side_effect = stalls
+        self.tools.camera_lookup_timeout = 0.3
+        self.buffer.put("camera-voice", b"a frame")
+
+        with self.assertLogs("echosphere.agent.tools.dispatch", level="WARNING"):
+            reply = self.reply()
+
+        self.assertTrue(reply.strip())
+        self.assertIn("no camera view", self.spoken_prompt())
+        self.assertEqual(self.cards(), [])
+
+    def test_a_lookup_that_raises_still_produces_a_reply(self):
+        """Verify a broken vision path never takes the conversation down with it."""
+        self.transport.side_effect = RuntimeError("vendor down")
+        self.buffer.put("camera-voice", b"a frame")
+
+        with self.assertLogs("echosphere.agent.tools.dispatch", level="WARNING"):
+            reply = self.reply()
+
+        self.assertTrue(reply.strip())
+        self.assertIn("no camera view", self.spoken_prompt())
+
+    def test_a_turn_without_a_channel_never_looks(self):
+        """
+        Verify the pre-REQ-CAM-03 callers are unaffected.
+
+        The ambient pipeline has no channel to look through, and must keep producing
+        exactly the reply it did before this feature existed.
+        """
+        self.buffer.put("camera-voice", b"a frame")
+
+        reply = "".join(self.agent.generate_spoken_reply(
+            speaker_id="Kenji", text="What is this?", detected_language="ja"
+        ))
+
+        self.assertTrue(reply.strip())
+        self.assertNotIn("no camera view", self.spoken_prompt())
+        self.assertEqual(self.transport.call_count, 0)
+
+    def test_the_scaffolding_pass_reuses_the_observation_without_a_second_card(self):
+        """
+        Verify the notes describe what was seen, not the pronoun (Task 3.3).
+
+        The scaffolding call runs after the spoken reply, against the same buffered
+        frame: it must reuse that description rather than pay for a second one, and must
+        not draw a duplicate of the card already on screen.
+        """
+        self.buffer.put("camera-voice", b"a frame")
+        self.reply()
+
+        context = self.agent.observe_live_camera(
+            self.session, "camera-voice", "Kenji", "What is this?", announce=False
+        )
+
+        self.assertIn("origami crane", context)
+        self.assertEqual(self.transport.call_count, 1)
+        self.assertEqual(len(self.cards()), 1)
 
 
 if __name__ == '__main__':

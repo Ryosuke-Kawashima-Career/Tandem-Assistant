@@ -63,6 +63,7 @@ from src.rtc.convoai_client import (
 )
 from src.agent.orchestrator import TeachingAgent
 from src.agent.tools.base import ToolState
+from src.agent.tools.camera_stream import CameraFrameBuffer
 from src.agent.tools.dispatch import ToolDispatcher
 from src.audio.vad_processor import VoiceActivityDetector
 from src.audio.stt_transcriber import STTTranscriber
@@ -147,7 +148,13 @@ class EchoSphereServer:
         # here rather than inside the agent so they publish over this server's own data
         # stream; each one is unconfigured - and reports itself so - until its credentials
         # are present in the environment.
-        self.tools = ToolDispatcher.from_env(data_stream=self.data_stream)
+        # REQ-CAM-01: the live camera frame the agent may look at mid-turn. Held on the
+        # server rather than inside the dispatcher so the ingestion endpoint and the
+        # lookup share one store, and so ending a session can empty it.
+        self.camera_buffer = CameraFrameBuffer()
+        self.tools = ToolDispatcher.from_env(
+            data_stream=self.data_stream, camera_buffer=self.camera_buffer
+        )
         self.agent = TeachingAgent(engine=engine, tools=self.tools)
         self.vad = VoiceActivityDetector()
         self.stt = STTTranscriber(engine=engine)
@@ -617,13 +624,24 @@ class EchoSphereServer:
         from the scheduled caller.
         """
         session_mode = self.session_mode_for(channel)
+
+        # REQ-CAM-03: the scaffolding reasons about the same observation the spoken reply
+        # did, so a note written about "this" records the object rather than the pronoun.
+        # `announce=False` because the spoken turn already published that card, and the
+        # per-frame cache means this normally costs no vendor call at all.
+        camera_context = self.agent.observe_live_camera(
+            self.sessions.get_session(channel) if channel else None,
+            channel or "", speaker_id, text, announce=False
+        )
+
         turn_result = self.agent.process_turn(
             speaker_id=speaker_id,
             text=text,
             detected_language=language,
             mode="tutor",
             record_turn=record_turn,
-            session_mode=session_mode
+            session_mode=session_mode,
+            camera_context=camera_context
         )
 
         self._broadcast_turn_payloads(turn_result, speaker_id, text)
@@ -778,12 +796,19 @@ class EchoSphereServer:
 
         The learner's turn is recorded here, so the scaffolding call must run with
         `record_turn=False` to avoid double-recording the same utterance.
+
+        The session and channel travel with the turn so the agent can look through the
+        learner's camera when they ask about something in front of them (REQ-CAM-03).
+        That lookup is bounded and conditional - see `TeachingAgent.observe_live_camera`
+        - so this stays the low-latency path it was.
         """
         return self.agent.generate_spoken_reply(
             speaker_id=speaker_id,
             text=text,
             detected_language=language,
-            session_mode=self.session_mode_for(channel)
+            session_mode=self.session_mode_for(channel),
+            session=self.sessions.get_session(channel) if channel else None,
+            channel=channel or ""
         )
 
     def schedule_convoai_scaffolding(
@@ -969,6 +994,10 @@ def api_stop_session():
     # REQ-17: the legs belong to the session, so they close with it. Left open, each one
     # holds a Gemini WebSocket for a channel nobody is in any more.
     server_instance.stop_translation(channel)
+
+    # REQ-CAM-01: a buffered frame belongs to the conversation it was pushed during, and
+    # nothing may look through a camera whose session has ended.
+    server_instance.camera_buffer.clear(channel)
 
     closed = server_instance.sessions.end_session(channel)
     if closed is not None:
@@ -1795,10 +1824,9 @@ def api_tools_anki_export():
     return _tool_response(result, "export", {"session_id": meta["session_id"]})
 
 
-@app.route("/api/tools/vision", methods=["POST"])
-def api_tools_vision():
+def _read_uploaded_frame(body, missing_message: str):
     """
-    Explains one captured camera frame as a material card (REQ-22).
+    Reads one camera frame out of the request, however the client chose to send it.
 
     Accepts the capture two ways because both are natural in a browser: a multipart
     `image` file, which is what `canvas.toBlob` produces, or a base64 `image_base64`
@@ -1806,18 +1834,13 @@ def api_tools_vision():
     third on a link that is already carrying a live conversation, so the file form is
     preferred - but requiring it would push that encoding decision onto every caller.
 
-    The frame is passed to the tool and dropped: nothing here stores it, and REQ-22 is
-    explicit that no image persists past generating the card unless the participant
-    chooses to save the result as a note.
+    Shared by the REQ-22 button capture and the REQ-CAM-01 periodic push so the two
+    cannot drift into accepting different things.
+
+    Returns:
+        `(frame, mime_type, None)` on success, or `(None, "", response)` carrying the 400
+        the endpoint should return.
     """
-    meta, _, error = _resolve_governed_session()
-    if error:
-        return error
-
-    body = request.get_json(silent=True) or {}
-    if not body and request.form:
-        body = request.form.to_dict()
-
     upload = request.files.get("image")
     if upload is not None:
         frame = upload.read()
@@ -1831,17 +1854,88 @@ def api_tools_vision():
         try:
             frame = base64.b64decode(encoded, validate=True) if encoded else b""
         except (ValueError, binascii.Error):
-            return jsonify({
+            return None, "", (jsonify({
                 "success": False,
                 "error": "`image_base64` is not valid base64 data."
-            }), 400
+            }), 400)
         mime_type = (body.get("mime_type") or "image/jpeg").strip()
 
     if not frame:
+        return None, "", (jsonify({"success": False, "error": missing_message}), 400)
+
+    return frame, mime_type, None
+
+
+@app.route("/api/session/camera/stream", methods=["POST"])
+def api_session_camera_stream():
+    """
+    Buffers the frame the camera is currently showing, for the agent to look at (REQ-CAM-01).
+
+    Deliberately the cheapest endpoint in this file: it stores one frame per channel and
+    returns. No vendor call, no event, no artifact. It runs every few seconds for as long
+    as Camera Assist is open, so anything it did per request would be paid for by a
+    participant who has not asked a question yet - which is exactly the cost REQ-CAM-04
+    bounds.
+
+    `active: false` is the opt-out: closing the camera panel clears the buffer at once
+    rather than leaving one last frame describable until its TTL runs out. Nothing here
+    persists a frame - the buffer is memory-only and self-expiring (see `camera_stream`).
+    """
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    body = request.get_json(silent=True) or {}
+    if not body and request.form:
+        body = request.form.to_dict()
+
+    channel = meta.get("channel") or ""
+
+    # A client that has just turned the camera off sends no frame; it is asking the
+    # server to forget the last one, which is the participant's own opt-out.
+    active = body.get("active")
+    if active in (False, "false", "False", 0, "0"):
+        server_instance.camera_buffer.clear(channel)
         return jsonify({
-            "success": False,
-            "error": "A camera lookup needs an `image` file or `image_base64` data."
-        }), 400
+            "success": True, "session_id": meta["session_id"], "buffered": False
+        })
+
+    frame, mime_type, error = _read_uploaded_frame(
+        body, "A camera frame push needs an `image` file or `image_base64` data."
+    )
+    if error:
+        return error
+
+    server_instance.camera_buffer.put(channel, frame, mime_type=mime_type)
+    return jsonify({"success": True, "session_id": meta["session_id"], "buffered": True})
+
+
+@app.route("/api/tools/vision", methods=["POST"])
+def api_tools_vision():
+    """
+    Explains one captured camera frame as a material card (REQ-22).
+
+    The capture arrives as a multipart file or as base64 (see `_read_uploaded_frame`).
+    This is the participant-triggered path and it is unchanged by REQ-CAM-03's
+    voice-initiated one: the two share only the underlying `CameraVisionTool`.
+
+    The frame is passed to the tool and dropped: nothing here stores it, and REQ-22 is
+    explicit that no image persists past generating the card unless the participant
+    chooses to save the result as a note.
+    """
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    body = request.get_json(silent=True) or {}
+    if not body and request.form:
+        body = request.form.to_dict()
+
+    frame, mime_type, error = _read_uploaded_frame(
+        body, "A camera lookup needs an `image` file or `image_base64` data."
+    )
+    if error:
+        return error
 
     result = server_instance.tools.describe_camera_frame(
         _session_from_meta(meta),

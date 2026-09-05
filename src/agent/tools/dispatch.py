@@ -20,6 +20,7 @@ import logging
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from src.agent.tools.anki_mcp import AnkiMCPTool
@@ -32,6 +33,10 @@ from src.agent.tools.base import (
     ToolNotConfiguredError,
     ToolResult,
     ToolState,
+)
+from src.agent.tools.camera_stream import (
+    CAMERA_LOOKUP_TIMEOUT_SECONDS,
+    CameraFrameBuffer,
 )
 from src.agent.tools.email import ResendEmailSender
 from src.agent.tools.google_calendar import GoogleCalendarTool
@@ -67,7 +72,9 @@ class ToolDispatcher:
         anki: Optional[AnkiMCPTool] = None,
         email: Optional[ResendEmailSender] = None,
         vision: Optional[CameraVisionTool] = None,
-        executor: Optional[ThreadPoolExecutor] = None
+        executor: Optional[ThreadPoolExecutor] = None,
+        camera_buffer: Optional[CameraFrameBuffer] = None,
+        camera_lookup_timeout: float = CAMERA_LOOKUP_TIMEOUT_SECONDS
     ):
         """
         Initialize the dispatcher over its (optional) tools and data stream.
@@ -76,6 +83,7 @@ class ToolDispatcher:
         1. Bind the data stream used to publish tool events.
         2. Bind each tool; `None` is treated exactly like an unconfigured one.
         3. Bind the executor for agent-initiated calls, created lazily when first needed.
+        4. Bind the live camera buffer, absent on a deployment that never streams frames.
         """
         self.data_stream = data_stream
         self.search = search
@@ -83,6 +91,8 @@ class ToolDispatcher:
         self.anki = anki
         self.email = email
         self.vision = vision
+        self.camera_buffer = camera_buffer
+        self.camera_lookup_timeout = camera_lookup_timeout
 
         self._executor = executor
         self._executor_lock = threading.Lock()
@@ -91,7 +101,8 @@ class ToolDispatcher:
     def from_env(
         cls,
         data_stream: Optional[Any] = None,
-        executor: Optional[ThreadPoolExecutor] = None
+        executor: Optional[ThreadPoolExecutor] = None,
+        camera_buffer: Optional[CameraFrameBuffer] = None
     ) -> "ToolDispatcher":
         """Builds a dispatcher with every tool resolved from the environment."""
         return cls(
@@ -101,7 +112,8 @@ class ToolDispatcher:
             anki=AnkiMCPTool(),
             email=ResendEmailSender(),
             vision=CameraVisionTool(),
-            executor=executor
+            executor=executor,
+            camera_buffer=camera_buffer
         )
 
     def status(self) -> Dict[str, bool]:
@@ -242,7 +254,26 @@ class ToolDispatcher:
             logger.warning("Describing a camera frame failed: %s", exc)
             return self._status_event("vision", session, ToolState.FAILED, str(exc))
 
-        card = {
+        card = self._camera_card(description, asked, materials, language, requested_by)
+        self._emit(EVENT_REFERENCE_CARD, session, "vision", "card", card, asked)
+        return ToolResult(tool="vision", state=ToolState.OK, payload=card)
+
+    @staticmethod
+    def _camera_card(
+        description: Any,
+        asked: str,
+        materials: bool,
+        language: str,
+        requested_by: str
+    ) -> Dict[str, Any]:
+        """
+        Shapes one described frame as the REQ-18 reference card.
+
+        Shared by the button flow and the voice-initiated one so a participant sees the
+        same card whichever way the question was asked - and, as in `describe_camera_frame`,
+        it deliberately carries no image data.
+        """
+        return {
             "query": asked,
             "source": "camera",
             "materials": materials,
@@ -255,7 +286,87 @@ class ToolDispatcher:
                 "image_url": "",
             }],
         }
-        self._emit(EVENT_REFERENCE_CARD, session, "vision", "card", card, asked)
+
+    # -- Live camera grounding (REQ-CAM-03) ------------------------------------------
+
+    def describe_live_frame(
+        self,
+        session: Any,
+        channel: str,
+        question: str = "",
+        requested_by: str = "voice",
+        emit_card: bool = True
+    ) -> Optional[ToolResult]:
+        """
+        Describes what the channel's camera is showing right now, or gives up (REQ-CAM-03).
+
+        This runs *inside* the spoken turn the learner is waiting on, which is the whole
+        reason its contract differs from `describe_camera_frame`'s: that one always
+        answers, because a participant pressed a button and is owed an outcome. This one
+        returns `None` for every unhappy path - no buffered frame, no vision tool, a slow
+        vendor - because its caller's fallback is simply to speak a normal reply, and a
+        `tool.status` event for "the camera happened to be off" would put an error on
+        screen for something nobody asked for.
+
+        Algorithm:
+        1. Read the channel's current frame; without a fresh one, look at nothing and pay
+           nothing (this is the gate that keeps "what is this word?" free).
+        2. Reuse the description already cached against that exact frame, if any, so the
+           3-second push interval cannot turn into a vendor call every 3 seconds.
+        3. Otherwise describe it on the shared executor under a hard wall-clock bound,
+           abandoning the call rather than letting it eat the turn's latency budget.
+        4. Publish the material card and return the same description to the caller - one
+           vendor call serving both the card on screen and the words spoken aloud.
+
+        `emit_card=False` is for the second reader of the same observation: the
+        scaffolding pass folds what was seen into the turn's notes, and it must not draw
+        a duplicate of the card the spoken turn already published.
+
+        Returns:
+            The `ToolResult` carrying the card payload, or `None` when the agent could not
+            see - in which case it must say so rather than guess.
+        """
+        if self.camera_buffer is None or not self._is_configured(self.vision):
+            return None
+
+        entry = self.camera_buffer.get(channel)
+        if entry is None:
+            return None
+
+        asked = (question or "").strip() or "What is in this image?"
+        materials = not _grades_language(session)
+        language = _first_language(session)
+
+        description = entry.description
+        if description is None:
+            future = self._submit(
+                self.vision.describe,
+                entry.frame,
+                mime_type=entry.mime_type,
+                question=asked,
+                language=language,
+                materials=materials
+            )
+            try:
+                description = future.result(timeout=self.camera_lookup_timeout)
+            except FutureTimeoutError:
+                # Deliberately not cancelled and not awaited: the worker may still be
+                # blocked on the vendor, and waiting for it here is exactly the latency
+                # this bound exists to refuse. Its result is simply discarded.
+                logger.warning(
+                    "A live camera lookup exceeded %.1fs and was abandoned; the reply "
+                    "will proceed without it.", self.camera_lookup_timeout
+                )
+                return None
+            except Exception as exc:  # noqa: BLE001 - reported, not raised
+                logger.warning("A live camera lookup failed: %s", exc)
+                return None
+
+            self.camera_buffer.remember_description(channel, entry, description)
+
+        card = self._camera_card(description, asked, materials, language, requested_by)
+        if emit_card:
+            self._emit(EVENT_REFERENCE_CARD, session, "vision", "card", card, asked)
         return ToolResult(tool="vision", state=ToolState.OK, payload=card)
 
     # -- Anki MCP (REQ-19) -----------------------------------------------------------

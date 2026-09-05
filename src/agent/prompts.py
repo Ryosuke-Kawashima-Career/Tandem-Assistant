@@ -246,7 +246,8 @@ def create_tutor_voice_prompt(
     target_language: str = "Japanese",
     native_language: str = "English",
     learner_name: str = "the student",
-    topic: Optional[str] = None
+    topic: Optional[str] = None,
+    extra_context: str = ""
 ) -> str:
     """
     Constructs the voice-critical 1:1 prompt for the low-latency fast path (REQ-LAT-02).
@@ -254,7 +255,10 @@ def create_tutor_voice_prompt(
     Algorithm:
     1. Incorporate the active topic and target/native language pairing.
     2. Incorporate the recent conversation history for this session only.
-    3. Instruct the model to reply to the newest utterance with speech text alone.
+    3. Incorporate anything the agent looked up mid-turn - today, what the student's
+       camera is currently showing (REQ-CAM-03) - so the reply is grounded in what was
+       actually seen rather than in what the phrasing implied.
+    4. Instruct the model to reply to the newest utterance with speech text alone.
 
     Deliberately asks for bare text rather than the structured JSON contract used by
     `create_tutor_prompt`. That is what makes token-level streaming safe (REQ-LAT-03): a
@@ -262,6 +266,7 @@ def create_tutor_voice_prompt(
     syntax aloud. The scaffolding fields are generated separately, off this path.
     """
     topic_str = f"Current Discussion Topic: {topic}\n" if topic else ""
+    context_str = f"\n{extra_context.strip()}\n" if extra_context and extra_context.strip() else ""
 
     prompt = f"""
 {topic_str}Target Language: {target_language}
@@ -272,7 +277,7 @@ Conversation So Far:
 \"\"\"
 {recent_context}
 \"\"\"
-
+{context_str}
 {learner_name} just said: "{latest_utterance}"
 
 Reply out loud to {learner_name} now. Output only the words to be spoken.
@@ -371,16 +376,19 @@ def create_work_voice_prompt(
     latest_utterance: str,
     working_language: str = "English",
     speaker_name: str = "the participant",
-    topic: Optional[str] = None
+    topic: Optional[str] = None,
+    extra_context: str = ""
 ) -> str:
     """
     Constructs the voice-critical `international_work` prompt (REQ-LAT-02).
 
     Mirrors `create_tutor_voice_prompt` - bare speakable text, never JSON, so tokens can
-    be streamed straight to TTS - but with the work framing: clarify and confirm, never
-    correct.
+    be streamed straight to TTS, and the same `extra_context` slot for what the agent
+    looked at mid-turn (REQ-CAM-03) - but with the work framing: clarify and confirm,
+    never correct.
     """
     topic_str = f"Meeting Topic: {topic}\n" if topic else ""
+    context_str = f"\n{extra_context.strip()}\n" if extra_context and extra_context.strip() else ""
 
     prompt = f"""
 {topic_str}Shared Working Language: {working_language}
@@ -390,7 +398,7 @@ Conversation So Far:
 \"\"\"
 {recent_context}
 \"\"\"
-
+{context_str}
 {speaker_name} just said: "{latest_utterance}"
 
 Say out loud only what genuinely helps the other participants understand or confirm this

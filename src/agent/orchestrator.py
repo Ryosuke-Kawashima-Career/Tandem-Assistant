@@ -14,6 +14,7 @@ Key Classes:
 
 import os
 import json
+import re
 import time
 import logging
 from typing import Optional, Dict, Any, List, Iterator
@@ -91,6 +92,73 @@ LANGUAGE_NAMES: Dict[str, str] = {
     "ja": "Japanese",
     "hi": "Hindi",
 }
+
+# Phrases that mean "look through my camera" rather than "answer my question"
+# (REQ-CAM-02). Kept as a documented regex list rather than a model call because this is
+# evaluated on *every* voice turn, and the one thing the voice path may not spend is a
+# round trip to decide whether to spend a round trip.
+#
+# The deictic family - "what is this", "what's that" - only counts when it ends the
+# clause. "What is this?" is a person holding something up; "what is this word" is a
+# question about what they just heard, and describing their desk to them would be an
+# answer to a question nobody asked. The rest of the list names the camera explicitly
+# enough that no such guard is needed.
+#
+# This check is one of two gates, never the only one: `generate_spoken_reply` also
+# requires a fresh buffered frame, so a false positive here with the camera off costs
+# nothing at all (Risk 2).
+CAMERA_QUESTION_PATTERNS = (
+    r"\bwhat(?:'s| is| are)\s+th(?:is|at|ese|ose)\s*(?=[?!.,]|$)",
+    r"\bwhat am i (?:looking at|holding|showing|pointing at)",
+    r"\bwhat(?:'s| is)\s+(?:in front of|before) me",
+    r"\b(?:can|could) you (?:see|read) th(?:is|at)",
+    r"\bdo you see th(?:is|at)",
+    r"\bwhat (?:does|do) th(?:is|ese) (?:say|mean)",
+    r"\b(?:look|take a look) at th(?:is|at)",
+    r"\bwhat is written (?:here|on th(?:is|at))",
+    r"\bwhat kind of .{0,20}\bis th(?:is|at)\s*(?=[?!.,]|$)",
+)
+
+_CAMERA_QUESTION_RE = re.compile("|".join(CAMERA_QUESTION_PATTERNS), re.IGNORECASE)
+
+
+# How a live camera lookup reaches the voice prompt. Phrased as a statement of fact
+# rather than as an instruction: the model is being told what is in front of the student,
+# and answers the question it was already going to answer, now with that in hand.
+CAMERA_SEEN_TEMPLATE = (
+    "What you can currently see through {learner}'s camera right now: {title} - "
+    "{description}\n"
+    "Answer using what is actually visible. Do not describe anything beyond it."
+)
+
+# The honest alternative to guessing. A camera-shaped question with no camera view is
+# common - the student says "what is this?" about a word they just heard - and the worst
+# possible reply is a confident description of a desk nobody is pointing at.
+CAMERA_BLIND_NOTE = (
+    "The student may be asking about something they are looking at, but you have no "
+    "camera view right now - Camera Assist is off, or it has sent nothing recently. If "
+    "they are asking about something physical, say briefly that you cannot see it and "
+    "that they can turn Camera Assist on. Never guess at what they are holding."
+)
+
+
+def looks_like_camera_question(text: str) -> bool:
+    """
+    Whether an utterance is asking about what the camera can see (REQ-CAM-02).
+
+    Costs nothing: a normalized string and one compiled alternation, run before the voice
+    prompt is built. A model call here would put a vendor round trip in front of every
+    spoken reply in order to avoid a vendor round trip, which is the wrong trade on the
+    one path a learner waits on in silence (REQ-LAT-02).
+
+    Returns:
+        True when the phrasing points at something in view, False otherwise.
+    """
+    normalized = " ".join((text or "").replace("’", "'").lower().split())
+    if not normalized:
+        return False
+    return bool(_CAMERA_QUESTION_RE.search(normalized))
+
 
 try:
     from openai import OpenAI
@@ -360,13 +428,17 @@ class TeachingAgent:
         speaker_id: str,
         text: str,
         detected_language: str = "ja",
-        topic: Optional[str] = None
+        topic: Optional[str] = None,
+        extra_context: str = ""
     ) -> str:
         """
         Builds the voice-critical 1:1 prompt for the session's language.
 
         The recent context deliberately excludes `text` itself, which is passed
         separately so the model sees clearly which utterance it is answering.
+
+        `extra_context` carries what the agent looked at during this turn - what the
+        camera is showing, or that it cannot currently see (REQ-CAM-03).
         """
         return create_tutor_voice_prompt(
             recent_context=self.format_history_context(),
@@ -374,7 +446,8 @@ class TeachingAgent:
             target_language=self.resolve_tutor_target_language(detected_language),
             native_language=self.native_language,
             learner_name=speaker_id,
-            topic=topic
+            topic=topic,
+            extra_context=extra_context
         )
 
     @staticmethod
@@ -413,7 +486,8 @@ class TeachingAgent:
         speaker_id: str,
         text: str,
         detected_language: str = "en",
-        topic: Optional[str] = None
+        topic: Optional[str] = None,
+        extra_context: str = ""
     ) -> str:
         """Builds the voice-critical `international_work` prompt (REQ-LAT-02)."""
         return create_work_voice_prompt(
@@ -421,7 +495,8 @@ class TeachingAgent:
             latest_utterance=text,
             working_language=self.native_language,
             speaker_name=speaker_id,
-            topic=topic
+            topic=topic,
+            extra_context=extra_context
         )
 
     def observed_languages(self) -> List[str]:
@@ -611,7 +686,8 @@ class TeachingAgent:
         topic: Optional[str] = None,
         mode: str = "mediation",
         record_turn: bool = True,
-        session_mode: Any = None
+        session_mode: Any = None,
+        camera_context: str = ""
     ) -> Dict[str, Any]:
         """
         Processes a newly transcribed student turn and generates real-time pedagogical scaffolding.
@@ -633,6 +709,11 @@ class TeachingAgent:
         `record_turn=False` is used by the Convo AI scaffolding call (REQ-LAT-02), which
         runs *after* `generate_spoken_reply` already recorded the same utterance. Without
         it the learner would appear in the model's context saying everything twice.
+
+        `camera_context` carries what the spoken turn actually saw (REQ-CAM-03), so a note
+        written about "this" records the object that was described rather than the
+        pronoun. It is supplied by the caller rather than looked up here: this call runs
+        after the spoken reply, and the two must reason about the same observation.
         """
         # Step 1: Record turn
         if record_turn:
@@ -668,6 +749,14 @@ class TeachingAgent:
             prompt = self.build_mediation_prompt(topic=topic)
             system_prompt = SYSTEM_PROMPT_TANDEM_TEACHER
 
+        # Prefixed rather than threaded through all three prompt builders: what the camera
+        # saw is one extra fact about this turn, identical in every mode. It goes in front
+        # so the JSON contract each builder ends with stays the last thing the model reads
+        # - the scaffolding call's output is parsed, and that ordering is what keeps it
+        # parseable.
+        if camera_context and camera_context.strip():
+            prompt = f"{camera_context.strip()}\n\n{prompt}"
+
         # Step 4: Dispatch to LLM
         if self.engine in ("openai", "whisper") and self._openai_client:
             return self._call_openai(
@@ -684,13 +773,71 @@ class TeachingAgent:
         else:
             return self._mock_mediation_response(speaker_id, text, detected_language)
 
+    def observe_live_camera(
+        self,
+        session: Any,
+        channel: str,
+        speaker_id: str,
+        text: str,
+        announce: bool = True
+    ) -> str:
+        """
+        Looks through the student's camera when the utterance points at it (REQ-CAM-03).
+
+        Two gates, both cheap before anything is spent:
+        1. The phrasing has to point at something in view (`looks_like_camera_question`),
+           which costs one regex and no network.
+        2. A fresh frame has to actually be buffered, which the dispatcher checks in
+           memory. With the camera off there is no vendor call at all - which is what
+           keeps a false-positive phrase from costing anything (Risk 1, Risk 2).
+
+        Every failure - no camera, no tool, a slow vendor, a raised exception - lands on
+        the same answer: the "I cannot see" note. Never an exception, and never silence:
+        this runs inside the turn the learner is waiting on, and the reply has to happen.
+
+        `announce=False` is for the scaffolding pass, which reads the same observation to
+        write the turn's notes and must not publish a second copy of the card the spoken
+        turn already drew.
+
+        Returns:
+            The context block for the voice prompt, or "" when the camera is irrelevant
+            to what was said.
+        """
+        if not channel or not looks_like_camera_question(text):
+            return ""
+
+        result = None
+        if self.tools is not None:
+            try:
+                result = self.tools.describe_live_frame(
+                    session, channel, question=text, requested_by="voice",
+                    emit_card=announce
+                )
+            except Exception as exc:  # noqa: BLE001 - the turn continues regardless
+                logger.warning(
+                    f"A live camera lookup raised ({exc}). Replying without it."
+                )
+                result = None
+
+        if result is None or not getattr(result, "ok", False):
+            return CAMERA_BLIND_NOTE
+
+        results = (result.payload or {}).get("results") or [{}]
+        return CAMERA_SEEN_TEMPLATE.format(
+            learner=speaker_id or "the student",
+            title=results[0].get("title", ""),
+            description=results[0].get("snippet", "")
+        )
+
     def generate_spoken_reply(
         self,
         speaker_id: str,
         text: str,
         detected_language: str = "ja",
         topic: Optional[str] = None,
-        session_mode: Any = None
+        session_mode: Any = None,
+        session: Any = None,
+        channel: str = ""
     ) -> Iterator[str]:
         """
         Streams the spoken 1:1 reply as plain text deltas (REQ-LAT-02 / REQ-LAT-03).
@@ -704,18 +851,24 @@ class TeachingAgent:
 
         Algorithm:
         1. Record the turn in history (this path owns it - see `record_turn`).
-        2. Build the plain-text voice prompt from the conversation so far.
-        3. Stream deltas from the configured provider, or emit the mock reply offline.
-        4. On any provider failure, fall back to speakable canned text rather than
+        2. Look through the student's camera, but only when the utterance points at
+           something in view and a fresh frame is buffered (REQ-CAM-03).
+        3. Build the plain-text voice prompt from the conversation so far.
+        4. Stream deltas from the configured provider, or emit the mock reply offline.
+        5. On any provider failure, fall back to speakable canned text rather than
            raising - silence ends the session via the Engine's idle_timeout.
+
+        `session` and `channel` are what make step 2 possible and are both optional: a
+        caller that passes neither gets exactly the pre-REQ-CAM-03 behaviour, which is
+        what the ambient pipeline and the older tests rely on.
 
         Returns:
             An iterator of successive text fragments. Concatenated, they form the full
             spoken reply.
 
-        Steps 1 and 2 run eagerly, before any iteration: this is a plain method
-        returning a generator rather than a generator function itself, so recording the
-        turn does not depend on the caller consuming the stream.
+        Steps 1 to 3 run eagerly, before any iteration: this is a plain method returning
+        a generator rather than a generator function itself, so recording the turn does
+        not depend on the caller consuming the stream.
         """
         # Step 1: This path owns history so the next turn's context is correct even
         # though the scaffolding call is asynchronous and may not have finished.
@@ -725,7 +878,13 @@ class TeachingAgent:
             "lang": detected_language
         })
 
-        # Step 2: Build the voice prompt from history *excluding* the utterance itself,
+        # Step 2: Look through the camera, but only when the utterance points at it and
+        # only for as long as the bound allows (REQ-CAM-03). Runs before the prompt is
+        # built because its result is part of the prompt; it is free when the phrasing is
+        # not camera-shaped, which is almost every turn.
+        camera_context = self.observe_live_camera(session, channel, speaker_id, text)
+
+        # Step 3: Build the voice prompt from history *excluding* the utterance itself,
         # which is passed separately so the model sees clearly what to answer.
         resolved_mode = self.resolve_session_mode(session_mode)
         if resolved_mode is SessionMode.INTERNATIONAL_WORK:
@@ -733,7 +892,8 @@ class TeachingAgent:
                 speaker_id=speaker_id,
                 text=text,
                 detected_language=detected_language,
-                topic=topic
+                topic=topic,
+                extra_context=camera_context
             )
             voice_system_prompt = SYSTEM_PROMPT_INTERNATIONAL_WORK_VOICE
         else:
@@ -741,7 +901,8 @@ class TeachingAgent:
                 speaker_id=speaker_id,
                 text=text,
                 detected_language=detected_language,
-                topic=topic
+                topic=topic,
+                extra_context=camera_context
             )
             voice_system_prompt = SYSTEM_PROMPT_TANDEM_TUTOR_VOICE
 
@@ -749,7 +910,7 @@ class TeachingAgent:
             started = time.time()
             emitted_any = False
 
-            # Step 3: Dispatch to the streaming provider leg
+            # Step 4: Dispatch to the streaming provider leg
             try:
                 if self.engine in ("openai", "whisper") and self._openai_client:
                     stream = self._stream_openai(prompt, voice_system_prompt)
@@ -769,7 +930,7 @@ class TeachingAgent:
                         )
                     yield delta
             except Exception as err:
-                # Step 4: A mid-stream provider failure must still end in speech.
+                # Step 5: A mid-stream provider failure must still end in speech.
                 logger.warning(
                     f"Spoken reply stream failed ({err}). "
                     f"Falling back to a canned reply so the agent does not go silent."

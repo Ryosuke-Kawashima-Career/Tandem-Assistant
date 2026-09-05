@@ -34,6 +34,7 @@ In traditional language classrooms, learners experience high conversational anxi
   - **Hindi <-> Japanese**: Direct cultural bridges, comparative grammar hints, and shared Subject-Object-Verb (SOV) structural alignment.
 - **Real-Time Synchronous Data Streaming**: Live visual scaffolding (subtitles, idiom popup cards, interactive quizzes, and balance indicators) broadcasted synchronously over Agora RTC Data Streams.
 - **Human-in-the-Loop Teacher Dashboard**: Human educators retain ultimate supervisory control with real-time room oversight, live transcript feeds, and on-demand intervention nudges.
+- **Camera Grounding, Opt-In and Bounded** (REQ-22 / REQ-24): with Camera Assist explicitly turned on, a participant can either capture a frame on demand ("Explain what I'm showing") or simply *ask out loud* — "what is this?" — and the co-teacher answers from what the camera is currently showing, no button press. Capture is strictly scoped to that toggle: the periodic push exists only between turning Camera Assist on and off, closing it clears the server's buffer immediately, frames are held in memory only and expire on their own, and nothing is captured, buffered, or billed outside that window. The lookup is gated on a free local phrase check plus a fresh buffered frame, cached per frame, and hard-bounded in time, so a slow vision call degrades to a normal spoken reply rather than delaying speech.
 - **Resilient Fallback Architecture**: Seamless graceful degradation from cloud AI models (Whisper / Gemini / Edge-TTS) to local heuristic pipelines during offline or high-latency network conditions.
 
 ---
@@ -249,6 +250,7 @@ installed (default `127.0.0.1:8765`, no API key):
 ```powershell
 $env:ANKI_CONNECT_URL = "http://127.0.0.1:8765"
 $env:LOG_LEVEL = "info"
+$env:PORT = "3000"
 npx @ankimcp/anki-mcp-server
 ```
 
