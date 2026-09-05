@@ -65,6 +65,11 @@ os.environ["GEMINI_API_KEY"] = ""
 # writing cards into somebody's real Anki collection, or creating a calendar event and
 # emailing invitations to whoever the test data names. Tests that exercise a configured
 # tool inject it explicitly, which is unaffected by these defaults.
+# `GeminiGroundedSearchTool` (the default search client, REQ-18) takes no credential of
+# its own - it reads `GEMINI_API_KEY`, already blanked above - so nothing below needs to
+# name it for `search` to come up unconfigured here. `GOOGLE_SEARCH_API_KEY`/
+# `GOOGLE_SEARCH_CSE_ID` remain for `GoogleSearchTool`, still exercised directly by its
+# own tests via explicit injection.
 for _tool_variable in (
     "GOOGLE_SEARCH_API_KEY",
     "GOOGLE_SEARCH_CSE_ID",

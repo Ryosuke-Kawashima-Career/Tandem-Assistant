@@ -883,6 +883,60 @@ body {
   margin-top: 6px;
 }
 
+/* Inline prompt dialog (D-UIUX-6) - replaces window.prompt() so the input step for
+   Research/Schedule cannot be silently suppressed by a browser or embedding context. */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.28);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-overlay.hidden {
+  display: none;
+}
+
+.modal-card {
+  width: min(380px, calc(100vw - 48px));
+  background: var(--macos-surface-overlay);
+  backdrop-filter: blur(20px);
+  border-radius: 14px;
+  box-shadow: var(--macos-shadow-modal);
+  padding: 18px;
+}
+
+.modal-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--macos-text-primary);
+  margin-bottom: 6px;
+}
+
+.modal-message {
+  font-size: 13px;
+  color: var(--macos-text-secondary);
+  margin-bottom: 10px;
+}
+
+.modal-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--macos-border-subtle);
+  font-size: 13px;
+  margin-bottom: 14px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .camera-preview {
   width: 100%;
   max-height: 180px;

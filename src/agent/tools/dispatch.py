@@ -35,7 +35,7 @@ from src.agent.tools.base import (
 )
 from src.agent.tools.email import ResendEmailSender
 from src.agent.tools.google_calendar import GoogleCalendarTool
-from src.agent.tools.google_search import GoogleSearchTool
+from src.agent.tools.gemini_search import GeminiGroundedSearchTool
 from src.agent.tools.vision import CameraVisionTool
 from src.artifacts.models import stable_entity_id
 
@@ -57,7 +57,12 @@ class ToolDispatcher:
     def __init__(
         self,
         data_stream: Optional[Any] = None,
-        search: Optional[GoogleSearchTool] = None,
+        # Duck-typed rather than a shared base class: `GoogleSearchTool` (Google Custom
+        # Search JSON API) and `GeminiGroundedSearchTool` (Gemini's built-in Search
+        # grounding, the default since Custom Search proved persistently unreachable on
+        # this deployment) both expose `name`/`is_configured`/`build_query`/`search`, and
+        # nothing here needs more than that.
+        search: Optional[Any] = None,
         calendar: Optional[GoogleCalendarTool] = None,
         anki: Optional[AnkiMCPTool] = None,
         email: Optional[ResendEmailSender] = None,
@@ -91,7 +96,7 @@ class ToolDispatcher:
         """Builds a dispatcher with every tool resolved from the environment."""
         return cls(
             data_stream=data_stream,
-            search=GoogleSearchTool(),
+            search=GeminiGroundedSearchTool(),
             calendar=GoogleCalendarTool(),
             anki=AnkiMCPTool(),
             email=ResendEmailSender(),

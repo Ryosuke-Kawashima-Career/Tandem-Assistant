@@ -313,6 +313,22 @@
     </footer>
   </div>
 
+  <!-- Inline prompt dialog (D-UIUX-6). Replaces window.prompt(), which several browsers
+       and embedding contexts suppress silently (no dialog shown, an immediate null
+       return) - a page-owned dialog cannot be suppressed that way, so a tool button can
+       no longer look identical to a broken one just because its input step vanished. -->
+  <div class="modal-overlay hidden" id="prompt-modal-overlay">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="prompt-modal-title">
+      <div class="modal-title" id="prompt-modal-title">Question</div>
+      <div class="modal-message" id="prompt-modal-message"></div>
+      <input type="text" class="modal-input" id="prompt-modal-input" autocomplete="off" />
+      <div class="modal-actions">
+        <button class="macos-action-btn" id="prompt-modal-cancel">Cancel</button>
+        <button class="macos-action-btn primary" id="prompt-modal-ok">OK</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Main Application Script -->
   <script type="module" src="./src/app.js"></script>
 </body>

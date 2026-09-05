@@ -313,6 +313,61 @@ class TandemApp {
   }
 
   /**
+   * Shows the inline prompt dialog and resolves with what was entered, or `null` if
+   * cancelled (D-UIUX-6).
+   *
+   * Not `window.prompt()`: several browsers and embedding contexts suppress native
+   * dialogs silently - no dialog shown, an immediate `null` return - which made a
+   * suppressed prompt and a cancelled one look identical to a completely broken button,
+   * with no request ever sent and nothing in a server log to tell the two apart.
+   *
+   * @param {string} message - What is being asked for
+   * @param {string} [defaultValue] - Pre-filled input value
+   * @returns {Promise<string|null>}
+   */
+  promptModal(message, defaultValue = '') {
+    return new Promise((resolve) => {
+      const overlay = document.getElementById('prompt-modal-overlay');
+      const messageEl = document.getElementById('prompt-modal-message');
+      const input = document.getElementById('prompt-modal-input');
+      const okBtn = document.getElementById('prompt-modal-ok');
+      const cancelBtn = document.getElementById('prompt-modal-cancel');
+      if (!overlay || !messageEl || !input || !okBtn || !cancelBtn) {
+        resolve(null);
+        return;
+      }
+
+      messageEl.textContent = message;
+      input.value = defaultValue;
+      overlay.classList.remove('hidden');
+      input.focus();
+
+      const cleanup = (result) => {
+        overlay.classList.add('hidden');
+        okBtn.removeEventListener('click', onOk);
+        cancelBtn.removeEventListener('click', onCancel);
+        input.removeEventListener('keydown', onKeydown);
+        resolve(result);
+      };
+      const onOk = () => cleanup(input.value);
+      const onCancel = () => cleanup(null);
+      const onKeydown = (event) => {
+        if (event.key === 'Enter') {
+          event.preventDefault();
+          onOk();
+        } else if (event.key === 'Escape') {
+          event.preventDefault();
+          onCancel();
+        }
+      };
+
+      okBtn.addEventListener('click', onOk);
+      cancelBtn.addEventListener('click', onCancel);
+      input.addEventListener('keydown', onKeydown);
+    });
+  }
+
+  /**
    * Researches a topic for the current session and publishes the card (REQ-18).
    *
    * The query is asked for rather than inferred: a participant pressing "Research" has
@@ -320,7 +375,7 @@ class TandemApp {
    * about whatever happened to be said most recently.
    */
   async researchTopic() {
-    const query = window.prompt('What should the AI co-teacher look up?');
+    const query = await this.promptModal('What should the AI co-teacher look up?');
     if (!query || !query.trim()) return;
 
     try {
@@ -377,12 +432,12 @@ class TandemApp {
    * display name; this deployment has no registry mapping those to email addresses.
    */
   async scheduleFollowUp() {
-    const startTime = window.prompt(
+    const startTime = await this.promptModal(
       'Start time for the follow-up (ISO-8601, e.g. 2026-09-10T09:00:00Z):'
     );
     if (!startTime || !startTime.trim()) return;
 
-    const attendeeList = window.prompt('Attendee email addresses (comma separated):') || '';
+    const attendeeList = (await this.promptModal('Attendee email addresses (comma separated):')) || '';
     const attendees = attendeeList
       .split(',')
       .map((address) => address.trim())
