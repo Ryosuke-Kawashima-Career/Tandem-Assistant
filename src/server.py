@@ -20,6 +20,7 @@ import time
 import queue
 import logging
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import Optional, Dict, Any, Iterator, List
 from dotenv import load_dotenv
@@ -40,6 +41,7 @@ load_dotenv(override=True)
 
 from src.rtc.agora_client import AgoraVoiceChannelClient, is_usable_credential
 from src.rtc.data_stream import DataStreamManager
+from src.rtc.rtm_publisher import RtmRestPublisher
 from src.artifacts.access import AccessDeniedError, require_access, resolve_actor
 from src.artifacts.adapters import (
     SUPPORTED_TARGETS as SUPPORTED_NOTION_TARGETS,
@@ -125,8 +127,20 @@ class EchoSphereServer:
         self.channel_name = channel_name
         self.engine = engine
 
-        # Step 2: RTC and Data Stream
-        self.rtc_client = AgoraVoiceChannelClient(channel_name=channel_name)
+        # Step 2: RTC and Data Stream. The publisher is what actually carries an event
+        # to the browser (D-UIUX-2): without it the data stream fans out to in-process
+        # callbacks only, which is why every generated subtitle, quiz, note and card was
+        # correct server-side and invisible in the UI.
+        self.rtm_publisher = RtmRestPublisher()
+        if not self.rtm_publisher.is_configured:
+            logger.warning(
+                "Agora RTM REST credentials absent: live session events will not reach "
+                "the browser. Set AGORA_APP_ID, AGORA_CUSTOMER_ID and "
+                "AGORA_CUSTOMER_SECRET to enable real-time delivery."
+            )
+        self.rtc_client = AgoraVoiceChannelClient(
+            channel_name=channel_name, rtm_publisher=self.rtm_publisher
+        )
         self.data_stream = DataStreamManager(self.rtc_client)
 
         # Step 3: AI and Audio Pipeline. The agent's external tools (REQ-18-20) are built
@@ -1244,6 +1258,20 @@ def api_rtc_token():
     # with - or RTM auth fails in ways that surface as generic startup errors.
     rtm_token = token_client.generate_rtm_token(str(uid))
 
+    # A second RTM identity for the session-event subscription (D-UIUX-2). It cannot
+    # reuse the one above: RTM allows one live login per identity, so subscribing twice
+    # under str(uid) would kick the Convo AI transcript client off whenever both are
+    # running - the ambient and tutor paths are meant to coexist.
+    #
+    # Unique per request, not per uid, because RTM frees an identity a moment after
+    # logout rather than immediately: a participant who left and rejoined within that
+    # window was refused with "-10027 user ID already in use" and silently lost live
+    # delivery for the rest of the session. Observed live on the first leave/rejoin
+    # test, not anticipated. A receive-only identity has no reason to be stable, so
+    # making it unique removes the race rather than retrying around it.
+    events_rtm_user_id = f"{uid}-events-{uuid.uuid4().hex[:8]}"
+    events_rtm_token = token_client.generate_rtm_token(events_rtm_user_id)
+
     return jsonify({
         "success": True,
         "app_id": token_client.app_id,
@@ -1252,6 +1280,8 @@ def api_rtc_token():
         "token": token,
         "rtm_token": rtm_token,
         "rtm_user_id": str(uid),
+        "events_rtm_token": events_rtm_token,
+        "events_rtm_user_id": events_rtm_user_id,
         "simulated": simulated
     }), 200
 

@@ -112,15 +112,21 @@ class AgoraVoiceChannelClient:
         app_certificate: Optional[str] = None,
         channel_name: str = "echosphere-tandem",
         uid: int = 0,
-        token_expiration_seconds: int = 86400
+        token_expiration_seconds: int = 86400,
+        rtm_publisher: Optional[Any] = None
     ):
         """
         Initialize Agora RTC Client credentials and connection state.
-        
+
         Algorithm:
         1. Resolve credentials from direct parameters or environment variables (.env).
         2. Set up initial channel state flags (is_connected, active_stream_id).
         3. Register empty dispatch tables for incoming audio frames and data stream events.
+        4. Bind the optional real transport used to actually deliver data stream events.
+
+        `rtm_publisher` is optional and duck-typed (`is_configured`/`publish`): a client
+        constructed without one keeps the in-process-callbacks-only behavior every
+        offline and simulated path already relies on.
         """
         # Step 1: Resolve credentials
         self.app_id = app_id or os.getenv("AGORA_APP_ID", "mock_app_id")
@@ -128,6 +134,11 @@ class AgoraVoiceChannelClient:
         self.channel_name = channel_name
         self.uid = uid
         self.token_expiration_seconds = token_expiration_seconds
+
+        # Step 4: Real delivery path (D-UIUX-2). Agora's RTC Data Stream cannot be
+        # published from this process - that needs an in-channel native SDK - so events
+        # travel over the Signaling (RTM) channel of the same name instead.
+        self.rtm_publisher = rtm_publisher
 
         # Step 2: Initialize connection state
         self.is_connected: bool = False
@@ -255,9 +266,12 @@ class AgoraVoiceChannelClient:
         Algorithm:
         1. Validate connection status and active stream ID.
         2. Construct an RTCDataStreamPacket with timestamp and payload.
-        3. Serialize packet to UTF-8 encoded bytes.
-        4. Dispatch packet over Agora Data Stream.
-        5. Invoke local registered data stream listener callbacks.
+        3. Publish it to the browser over the real transport, when one is attached.
+        4. Invoke local registered data stream listener callbacks.
+
+        Local callbacks fire whether or not real delivery succeeded: they are
+        in-process subscribers (the simulation demo, tests) and suppressing them on a
+        transport failure would turn one broken path into two.
         """
         if not self.is_connected:
             logger.warning("Cannot send data stream message: client is not connected to Agora RTC.")
@@ -267,10 +281,14 @@ class AgoraVoiceChannelClient:
         packet = RTCDataStreamPacket(event_type=event_type, payload=payload)
         raw_bytes = packet.to_bytes()
 
-        # Step 3 & 4: Dispatch payload
+        # Step 3: Real delivery (D-UIUX-2). Without a publisher this stays what it has
+        # always been - a local fan-out - which is what the offline and simulated paths
+        # expect; with one, the event actually reaches the browser.
         logger.debug(f"Broadcasting Data Stream event '{event_type}' ({len(raw_bytes)} bytes) to channel '{self.channel_name}'")
+        if self.rtm_publisher is not None:
+            self.rtm_publisher.publish(self.channel_name, event_type, payload)
 
-        # Step 5: Notify local subscribers/listeners
+        # Step 4: Notify local subscribers/listeners
         for cb in self._on_data_stream_callbacks:
             try:
                 cb(packet)

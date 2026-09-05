@@ -486,6 +486,38 @@ class TestConvoAIEndpoints(unittest.TestCase):
         # RTC and RTM tokens are distinct credentials, not the same string reused
         self.assertNotEqual(data["rtm_token"], data["token"])
 
+    def test_rtc_token_includes_a_separate_identity_for_session_events(self):
+        """
+        Verify the session-event subscription (D-UIUX-2) gets its own RTM identity.
+
+        It must not be `str(uid)`: RTM permits one live login per identity, so reusing
+        it would kick the Convo AI transcript client off whenever both the ambient and
+        tutor paths are active - which they are meant to be simultaneously.
+        """
+        res = self.app.get("/api/rtc/token?channel=tokyo-mumbai-101&uid=4242")
+        data = res.get_json()
+
+        self.assertTrue(data["events_rtm_token"])
+        self.assertTrue(data["events_rtm_user_id"].startswith("4242-events"))
+        self.assertNotEqual(data["events_rtm_user_id"], data["rtm_user_id"])
+        self.assertNotEqual(data["events_rtm_token"], data["rtm_token"])
+
+    def test_session_event_identity_is_unique_per_request(self):
+        """
+        Verify two token requests for the same uid get different event identities.
+
+        RTM frees an identity a short while after logout, not immediately: with a
+        fixed identity, a participant who left and rejoined inside that window was
+        refused with "-10027 user ID already in use" and silently lost live delivery
+        for the rest of the session. Found on the first live leave/rejoin test.
+        """
+        first = self.app.get("/api/rtc/token?channel=c&uid=4242").get_json()
+        second = self.app.get("/api/rtc/token?channel=c&uid=4242").get_json()
+
+        self.assertNotEqual(
+            first["events_rtm_user_id"], second["events_rtm_user_id"]
+        )
+
     def test_broadcast_skipped_when_backend_rtc_disconnected(self):
         """
         Verify turn payloads are not dispatched when the backend RTC client is not in

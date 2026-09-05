@@ -18,6 +18,7 @@ import { AgoraStreamManager } from './services/agoraStream.js';
 import { ConvoAIService } from './services/convoai.js';
 import { requestJson } from './services/http.js';
 import { ConvoAITranscriptService } from './services/convoaiTranscript.js';
+import { SessionEventService } from './services/sessionEvents.js';
 import { Subtitles } from './components/Subtitles.js';
 import { IdiomCard } from './components/IdiomCard.js';
 import { TopicWidget } from './components/TopicWidget.js';
@@ -157,6 +158,11 @@ class TandemApp {
     // Step 3: Stream Manager
     this.streamManager = new AgoraStreamManager();
     this.setupStreamListeners();
+
+    // Live session events (D-UIUX-2). Feeds the same stream manager the RTC data
+    // stream was always supposed to, so every widget above is unaffected by which
+    // transport actually carried the event.
+    this.sessionEvents = new SessionEventService(this.streamManager);
 
     // Step 4: UI Event Handlers
     this.bindDomEvents();
@@ -1611,8 +1617,12 @@ class TandemApp {
     const connDot = document.getElementById('connection-dot');
 
     if (!this.isJoined) {
+      // Declared outside the try because the catch below is a real join path too - a
+      // participant whose microphone fails still joins and still needs live events -
+      // and it cannot subscribe without these credentials.
+      let creds = null;
       try {
-        const creds = await this.convoai.fetchRtcCredentials(this.localUid);
+        creds = await this.convoai.fetchRtcCredentials(this.localUid);
         const micBlockedReason = this.getMicUnavailableReason();
 
         if (creds && !creds.simulated && creds.app_id && !micBlockedReason) {
@@ -1661,6 +1671,8 @@ class TandemApp {
         // notes, quizzes, and export are all governed by.
         await this.startSession();
 
+        await this.subscribeToSessionEvents(creds);
+
         this.isJoined = true;
         // REQ-23: the session clock starts when the participant joins, and speech
         // measurement starts with it when there is a real microphone track to measure.
@@ -1676,6 +1688,10 @@ class TandemApp {
         console.warn('RTC Connect Notice (Running in Local Mode):', err);
         await this.releaseRtcResources();
         await this.startSession();
+        // Subscribed here too: this path is a real join (the session exists and the
+        // button now says "Leave"), and a failed microphone is the case that needs
+        // delivered subtitles most, not least.
+        await this.subscribeToSessionEvents(creds);
         this.isJoined = true;
         this.startSessionTimer();
         this.startArtifactPolling();
@@ -1755,8 +1771,34 @@ class TandemApp {
    * Closes the local microphone track and leaves the RTC channel.
    * Safe to call when nothing is currently allocated.
    */
+  /**
+   * Subscribes to this channel's live session events (REQ-03, D-UIUX-2).
+   *
+   * Called from every join path, including the one a failed microphone lands on: the
+   * events carry subtitles, idiom cards, quizzes, notes, reference cards, and tool
+   * status, none of which depend on this participant having a working mic. For the
+   * ambient (non-Convo-AI) path this is the only route those ever take to the browser.
+   *
+   * Never throws: without it the UI falls back to the Task 1.3 REST poll for notes and
+   * quizzes, which is degraded but not broken, and joining must not fail over it.
+   *
+   * @param {Object|null} creds - The `/api/rtc/token` response for this join
+   * @returns {Promise<boolean>} True when live delivery is active
+   */
+  async subscribeToSessionEvents(creds) {
+    return this.sessionEvents.connect({
+      appId: creds?.app_id,
+      channel: creds?.channel || this.channelName,
+      token: creds?.events_rtm_token,
+      userId: creds?.events_rtm_user_id
+    });
+  }
+
   async releaseRtcResources() {
     await this.transcriptService.disconnect();
+    // Released with the rest of the join, so a rejoin subscribes cleanly rather than
+    // stacking a second RTM login on the same identity.
+    await this.sessionEvents.disconnect();
 
     // REQ-23: stop sampling before the track it samples is closed, and flush whatever
     // was measured but not yet reported - the last few seconds of speech count too.
