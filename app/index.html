@@ -14,17 +14,30 @@
       <div class="macos-header-title">
         <span>🌐 EchoSphere</span>
         <span style="font-weight: 400; color: var(--macos-text-secondary);">—</span>
-        <span>Tandem Co-Teacher</span>
-        <span class="macos-badge-pill" id="room-badge">📡 Channel: tokyo-mumbai-101</span>
+        <span>Fluency Co-pilot</span>
       </div>
 
       <div class="macos-header-status">
         <!-- Session mode (REQ-12). Immutable once a session starts, so the backend
              rejects a mid-session switch and these buttons disable while one is live. -->
-        <div class="macos-segmented-control" id="mode-switcher" title="Session mode - fixed once the session starts">
-          <button class="macos-segmented-btn active" data-mode="language_learning">🎓 Language Learning</button>
-          <button class="macos-segmented-btn" data-mode="international_work">🌏 International Work</button>
-        </div>
+        <select class="macos-lang-select" id="mode-select"
+                title="Session mode - fixed once the session starts">
+          <option value="language_learning">🎓 Language Learning</option>
+          <option value="international_work">🌏 International Work</option>
+        </select>
+
+        <!-- Joining and muting are the two controls a participant reaches for before
+             anything else, so they sit in the config bar rather than among the tools. -->
+        <button class="macos-action-btn primary" id="btn-join">
+          <span id="btn-join-icon">📞</span>
+          <span id="btn-join-text">Join</span>
+        </button>
+
+        <button class="macos-action-btn" id="btn-mic" disabled>
+          <span id="btn-mic-icon">🎙️</span>
+          <span id="btn-mic-text">Mute</span>
+        </button>
+
         <div style="display: flex; align-items: center; gap: 6px;">
           <span class="status-dot" id="connection-dot"></span>
           <span class="status-text" id="connection-status">SD-RTN™ Ready</span>
@@ -45,18 +58,6 @@
     <!-- 2. macOS Floating Pill Toolbar -->
     <div class="macos-toolbar-container">
       <div class="macos-pill-toolbar">
-        <button class="macos-action-btn primary" id="btn-join">
-          <span id="btn-join-icon">📞</span>
-          <span id="btn-join-text">Join Channel</span>
-        </button>
-
-        <button class="macos-action-btn" id="btn-mic" disabled>
-          <span id="btn-mic-icon">🎙️</span>
-          <span id="btn-mic-text">Mute Mic</span>
-        </button>
-
-        <div style="width: 1px; height: 18px; background: var(--macos-border-subtle); margin: 0 4px;"></div>
-
         <button class="macos-action-btn convoai" id="btn-convoai" title="Start a live spoken conversation with the AI co-teacher">
           <span id="btn-convoai-icon">🤖</span>
           <span id="btn-convoai-text">Talk to AI</span>
@@ -88,31 +89,15 @@
           <span>Research</span>
         </button>
 
-        <button class="macos-action-btn" id="btn-schedule" disabled
-                title="Book a follow-up session and invite the participants">
-          <span>📅</span>
-          <span>Schedule Follow-up</span>
-        </button>
-
         <!-- REQ-22: camera assist. Explains one captured frame - a page, a whiteboard, a
              handover document - rather than opening a video leg. -->
         <button class="macos-action-btn" id="btn-camera" disabled aria-pressed="false"
                 title="Show the AI co-teacher what you are looking at">
           <span id="btn-camera-icon">📷</span>
-          <span id="btn-camera-text">Camera Assist</span>
+          <span id="btn-camera-text">Camera</span>
         </button>
 
         <div style="width: 1px; height: 18px; background: var(--macos-border-subtle); margin: 0 4px;"></div>
-
-        <button class="macos-action-btn" id="btn-simulation" title="Run realistic tri-lingual dialogue simulation">
-          <span>✨</span>
-          <span>Simulate Tandem Dialogue</span>
-        </button>
-
-        <button class="macos-action-btn" id="btn-clear" title="Clear all subtitles and scaffolding">
-          <span>🗑️</span>
-          <span>Clear Feed</span>
-        </button>
 
         <!-- REQ-15 / REQ-19: one export control for every destination this session's
              notes and quizzes can reach. Anki used to sit apart in the tools group,
@@ -206,6 +191,14 @@
             </button>
           </div>
 
+          <!-- The scripted dialogue preview lives beside the topic it rewrites, not in
+               the tool bar: it is a demo of this panel, not a session control. -->
+          <button class="macos-action-btn" id="btn-simulation" style="width: 100%;"
+                  title="Replay a scripted tri-lingual dialogue to preview the UI offline">
+            <span>✨</span>
+            <span>Simulate Tandem Dialogue</span>
+          </button>
+
           <!-- Active Conversational Topic -->
           <div class="topic-card">
             <div class="topic-tag">🎯 Active Conversation Topic</div>
@@ -219,10 +212,12 @@
       <section class="macos-card-panel" id="panel-subtitles">
         <div class="macos-panel-header">
           <span class="macos-panel-title">💬 Live Tri-Lingual Subtitles</span>
-          <div style="display: flex; gap: 6px;">
+          <div style="display: flex; gap: 6px; align-items: center;">
             <span class="lang-flag-pill">🇯🇵 JA</span>
             <span class="lang-flag-pill">🇮🇳 HI</span>
             <span class="lang-flag-pill">🇬🇧 EN</span>
+            <button class="panel-clear-btn" id="btn-clear-subtitles"
+                    title="Clear the subtitle feed" aria-label="Clear the subtitle feed">🗑️</button>
           </div>
         </div>
         <div class="macos-panel-content" id="subtitles-container">
@@ -256,8 +251,13 @@
       <!-- Right Column: AI Co-Teacher Scaffolding -->
       <section class="macos-card-panel" id="panel-scaffolding">
         <div class="macos-panel-header">
-          <span class="macos-panel-title" id="scaffolding-title">✨ AI Pedagogical Insights</span>
-          <span class="macos-badge-pill" style="background: rgba(52, 199, 89, 0.1); color: var(--macos-accent-green); border-color: rgba(52, 199, 89, 0.2);">Live Assist</span>
+          <span class="macos-panel-title" id="scaffolding-title">✨ Quiz & Insights</span>
+          <div style="display: flex; gap: 6px; align-items: center;">
+            <span class="macos-badge-pill" style="background: rgba(52, 199, 89, 0.1); color: var(--macos-accent-green); border-color: rgba(52, 199, 89, 0.2);">Live Assist</span>
+            <button class="panel-clear-btn" id="btn-clear-insights"
+                    title="Clear insights, quizzes, and research cards"
+                    aria-label="Clear insights, quizzes, and research cards">🗑️</button>
+          </div>
         </div>
         <div class="macos-panel-content" id="scaffolding-container">
           <!-- Placeholder Card -->
@@ -274,7 +274,11 @@
              the note vocabulary rendered here follows the session mode. -->
         <div class="macos-panel-header" style="margin-top: 12px;">
           <span class="macos-panel-title" id="notes-title">📝 Session Notes</span>
-          <span class="macos-badge-pill" id="notes-count">0</span>
+          <div style="display: flex; gap: 6px; align-items: center;">
+            <span class="macos-badge-pill" id="notes-count">0</span>
+            <button class="panel-clear-btn" id="btn-clear-notes"
+                    title="Clear the session notes" aria-label="Clear the session notes">🗑️</button>
+          </div>
         </div>
         <div class="macos-panel-content" id="notes-container">
           <div class="notes-empty" id="notes-empty-hint">

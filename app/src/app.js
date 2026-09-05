@@ -58,6 +58,31 @@ const CAMERA_STREAM_MAX_EDGE = 640;
 // JPEG quality for those pushes, below the on-demand capture's 0.85 for the same reason.
 const CAMERA_STREAM_QUALITY = 0.7;
 
+// Topics the offline simulation (15.3) rotates through. The scripted timeline used to
+// leave "Active Conversation Topic" on its hardcoded default, so the one panel the demo
+// is now launched from was the one panel it never changed. None of these repeats the
+// default already rendered in index.html, so even the first run visibly moves the card.
+// Demo fixtures, not generated content - the live topic still arrives over the data
+// stream.
+const SIMULATION_TOPICS = [
+  {
+    topic_title: 'Commuting in Tokyo and Mumbai',
+    prompt: 'Describe your daily commute. What surprises a visitor most about it?'
+  },
+  {
+    topic_title: 'Saying No Politely',
+    prompt: 'How do you decline an invitation without giving offence? Give an example in your own language.'
+  },
+  {
+    topic_title: 'Weekend Markets',
+    prompt: 'What would you buy at a local market at home, and what would you tell a visitor to try first?'
+  },
+  {
+    topic_title: 'Work Introductions',
+    prompt: 'Introduce yourself as you would to a new colleague. What do you mention first, and why?'
+  }
+];
+
 class TandemApp {
   /**
    * Initialize Tandem Application.
@@ -324,7 +349,6 @@ class TandemApp {
   updateToolControls() {
     const controls = [
       ['btn-research', 'search', 'Google Search is not configured on this server.'],
-      ['btn-schedule', 'calendar', 'Google Calendar is not configured on this server.'],
       ['btn-camera', 'vision', 'Camera assist needs GEMINI_API_KEY on this server.'],
       // Anki lives in the export selector rather than in its own toolbar button, but
       // the availability rule is the same: an option nothing backs is disabled, not
@@ -451,42 +475,6 @@ class TandemApp {
       // indistinguishable from a button that does nothing.
       this.referenceCard.renderNotice('Anki Export', err.message, false);
       console.warn('🗂️ Anki export failed:', err.message);
-    }
-  }
-
-  /**
-   * Books a follow-up meeting for this session (REQ-20).
-   *
-   * Attendee addresses are collected here because a session records participants by
-   * display name; this deployment has no registry mapping those to email addresses.
-   */
-  async scheduleFollowUp() {
-    const startTime = await this.promptModal(
-      'Start time for the follow-up (ISO-8601, e.g. 2026-09-10T09:00:00Z):'
-    );
-    if (!startTime || !startTime.trim()) return;
-
-    const attendeeList = (await this.promptModal('Attendee email addresses (comma separated):')) || '';
-    const attendees = attendeeList
-      .split(',')
-      .map((address) => address.trim())
-      .filter(Boolean);
-
-    try {
-      const body = await requestJson('/api/tools/calendar/schedule', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          channel: this.channelName,
-          actor: this.speakerId,
-          start_time: startTime.trim(),
-          duration_minutes: 30,
-          attendees
-        })
-      });
-      console.log('📅 Meeting scheduled:', body);
-    } catch (err) {
-      console.warn('📅 Scheduling failed:', err.message);
     }
   }
 
@@ -852,7 +840,7 @@ class TandemApp {
       btn.classList.toggle('danger', this.isCameraOn);
       btn.setAttribute('aria-pressed', String(this.isCameraOn));
     }
-    if (text) text.textContent = this.isCameraOn ? 'Stop Camera' : 'Camera Assist';
+    if (text) text.textContent = this.isCameraOn ? 'Stop Camera' : 'Camera';
   }
 
   /**
@@ -1179,7 +1167,7 @@ class TandemApp {
     const scaffoldingTitle = document.getElementById('scaffolding-title');
     if (scaffoldingTitle) {
       scaffoldingTitle.textContent = isLearning
-        ? '✨ AI Pedagogical Insights'
+        ? '✨ Quiz & Insights'
         : '✨ Terms, Intent & Clarifications';
     }
 
@@ -1311,10 +1299,10 @@ class TandemApp {
    * so this only stops the user from making a request that is guaranteed to fail.
    */
   setModeSwitcherLocked(locked) {
-    document.querySelectorAll('#mode-switcher button').forEach((btn) => {
-      btn.disabled = locked;
-      btn.classList.toggle('locked', locked);
-    });
+    const select = document.getElementById('mode-select');
+    if (!select) return;
+    select.disabled = locked;
+    select.classList.toggle('locked', locked);
   }
 
   /**
@@ -1342,18 +1330,20 @@ class TandemApp {
     // Session mode switcher (REQ-12). The mode decides which assistance the backend
     // runs and which note vocabulary it may emit, and it cannot change mid-session -
     // artifacts already generated under the first mode would contradict the second.
-    const modeButtons = document.querySelectorAll('#mode-switcher button');
-    modeButtons.forEach(btn => {
-      btn.addEventListener('click', () => {
+    const modeSelect = document.getElementById('mode-select');
+    if (modeSelect) {
+      modeSelect.value = this.currentMode;
+      modeSelect.addEventListener('change', () => {
         if (this.isAiActive || this.isAiPending) {
           console.warn('Session mode is fixed while a conversation is live. End it first.');
+          // The selector is disabled while a conversation is live, so this only runs if
+          // that lock was bypassed; put the control back on the mode actually in force.
+          modeSelect.value = this.currentMode;
           return;
         }
-        modeButtons.forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        this.setSessionMode(btn.getAttribute('data-mode'));
+        this.setSessionMode(modeSelect.value);
       });
-    });
+    }
     this.setSessionMode(this.currentMode);
 
     // Export the stored session (REQ-15 / REQ-19). One control, one destination
@@ -1368,11 +1358,6 @@ class TandemApp {
     const btnResearch = document.getElementById('btn-research');
     if (btnResearch) {
       btnResearch.addEventListener('click', () => this.researchTopic());
-    }
-
-    const btnSchedule = document.getElementById('btn-schedule');
-    if (btnSchedule) {
-      btnSchedule.addEventListener('click', () => this.scheduleFollowUp());
     }
 
     // Camera assist (REQ-22), gated on the same availability check as the tools above.
@@ -1452,15 +1437,21 @@ class TandemApp {
       btnSim.addEventListener('click', () => this.runSimulationDemo());
     }
 
-    // Clear Feed
-    const btnClear = document.getElementById('btn-clear');
-    if (btnClear) {
-      btnClear.addEventListener('click', () => {
-        this.subtitles.clear();
+    // Panel-scoped clears (REQ-25). Each one empties the panel it sits in and nothing
+    // else, so clearing a stray research card no longer takes the subtitle feed with it.
+    const clearActions = [
+      ['btn-clear-subtitles', () => this.subtitles.clear()],
+      ['btn-clear-insights', () => {
         this.idiomCard.clear();
         this.quizWidget.clear();
-      });
-    }
+        this.referenceCard.clear();
+      }],
+      ['btn-clear-notes', () => this.notesPanel.clear()],
+    ];
+    clearActions.forEach(([id, action]) => {
+      const btn = document.getElementById(id);
+      if (btn) btn.addEventListener('click', action);
+    });
   }
 
   /**
@@ -1798,7 +1789,7 @@ class TandemApp {
         this.startSessionTimer();
         this.startSpeechMeasurement();
         this.startArtifactPolling();
-        if (btnJoinText) btnJoinText.textContent = 'Leave Channel';
+        if (btnJoinText) btnJoinText.textContent = 'Leave';
         if (btnJoin) btnJoin.classList.add('danger');
         if (btnMic) btnMic.disabled = false;
         if (connDot) connDot.style.backgroundColor = 'var(--macos-accent-green)';
@@ -1814,7 +1805,7 @@ class TandemApp {
         this.isJoined = true;
         this.startSessionTimer();
         this.startArtifactPolling();
-        if (btnJoinText) btnJoinText.textContent = 'Leave Channel';
+        if (btnJoinText) btnJoinText.textContent = 'Leave';
         if (btnJoin) btnJoin.classList.add('danger');
         if (btnMic) btnMic.disabled = false;
         if (connStatus) connStatus.textContent = 'Simulated Audio (Mic Unavailable)';
@@ -1838,7 +1829,7 @@ class TandemApp {
       // capture stream running behind a hidden panel (REQ-22).
       this.stopCamera();
 
-      if (btnJoinText) btnJoinText.textContent = 'Join Channel';
+      if (btnJoinText) btnJoinText.textContent = 'Join';
       if (btnJoin) btnJoin.classList.remove('danger');
       if (btnMic) btnMic.disabled = true;
       if (connStatus) connStatus.textContent = 'Disconnected';
@@ -1959,11 +1950,11 @@ class TandemApp {
     }
 
     if (this.isMuted) {
-      if (btnMicText) btnMicText.textContent = 'Unmute Mic';
+      if (btnMicText) btnMicText.textContent = 'Unmute';
       if (btnMicIcon) btnMicIcon.textContent = '🔇';
       if (btnMic) btnMic.classList.add('danger');
     } else {
-      if (btnMicText) btnMicText.textContent = 'Mute Mic';
+      if (btnMicText) btnMicText.textContent = 'Mute';
       if (btnMicIcon) btnMicIcon.textContent = '🎙️';
       if (btnMic) btnMic.classList.remove('danger');
     }
@@ -2178,6 +2169,11 @@ class TandemApp {
     }
 
     console.log('▶️ Running Tandem Multi-Lingual Simulation Demo (scripted, offline preview)...');
+
+    // Advance the topic card so a repeated run is visibly a new conversation rather
+    // than the same one replayed under an unchanged heading.
+    this.simulationTopicIndex = ((this.simulationTopicIndex ?? -1) + 1) % SIMULATION_TOPICS.length;
+    this.topicWidget.updateTopic(SIMULATION_TOPICS[this.simulationTopicIndex]);
 
     const demoTimeline = [
       {

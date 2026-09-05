@@ -99,10 +99,18 @@ export class NotesPanel {
    *
    * Algorithm:
    * 1. Toggle the empty-state hint and the count badge.
-   * 2. Render one card per note, newest first, flagging unconfirmed ones.
+   * 2. Diff the desired note order against the cards already in the DOM, keyed by
+   *    `data-note-id`: build a card only for a note that is new or whose rendered
+   *    markup changed, reuse the existing element otherwise, and drop cards whose
+   *    note is gone.
+   * 3. Reorder the surviving elements in place to match newest-first.
    *
-   * A full redraw rather than incremental DOM patching: the list is short, and a redraw
-   * cannot drift out of step with the map the way targeted edits can.
+   * Keyed rather than a blanket `innerHTML` rebuild: the panel is redrawn on every
+   * artifact poll (~5s) as well as on every note event, and a rebuild re-creates every
+   * card, so each poll replayed the `macos-pop-in` entrance on notes that had not
+   * changed - the whole list flashing every few seconds. Reusing an unchanged note's
+   * element leaves its animation finished and untouched, so the entrance now marks what
+   * it is supposed to mark: a note that genuinely just arrived.
    */
   render() {
     if (!this.container) return;
@@ -110,15 +118,52 @@ export class NotesPanel {
     if (this.countBadge) this.countBadge.textContent = String(this.notes.size);
     if (this.emptyHint) this.emptyHint.classList.toggle('hidden', this.notes.size > 0);
 
-    const cards = [...this.notes.values()]
-      .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0))
-      .map((note) => this.renderCard(note))
-      .join('');
+    const ordered = [...this.notes.values()]
+      .sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
 
-    const hint = this.emptyHint ? this.emptyHint.outerHTML : '';
-    this.container.innerHTML = hint + cards;
-    this.emptyHint = this.container.querySelector('#notes-empty-hint');
-    if (this.emptyHint) this.emptyHint.classList.toggle('hidden', this.notes.size > 0);
+    // Step 2: index what is already on screen, then claim or rebuild one card per note.
+    const existing = new Map();
+    this.container.querySelectorAll('[data-note-id]').forEach((el) => {
+      existing.set(el.getAttribute('data-note-id'), el);
+    });
+
+    const elements = ordered.map((note) => {
+      const html = this.renderCard(note);
+      const current = existing.get(String(note.id));
+      if (current) {
+        existing.delete(String(note.id));
+        // Compared as markup rather than by a revision field: the note contract has no
+        // version, and re-rendering a card whose text is identical is exactly the
+        // needless entrance replay this method exists to avoid.
+        if (current.outerHTML.trim() === html.trim()) return current;
+        const replacement = this.buildCard(html);
+        if (replacement) {
+          current.replaceWith(replacement);
+          return replacement;
+        }
+        return current;
+      }
+      return this.buildCard(html);
+    }).filter(Boolean);
+
+    // Anything left in `existing` belongs to a note that was deleted.
+    existing.forEach((el) => el.remove());
+
+    // Step 3: put the cards in order. `append` moves an element already in the
+    // container rather than cloning it, so a reused card keeps its finished animation.
+    elements.forEach((el) => this.container.append(el));
+  }
+
+  /**
+   * Turns one card's markup into a detached element.
+   *
+   * @param {string} html - Markup from `renderCard`
+   * @returns {?HTMLElement} The card element, or `null` if the markup produced none
+   */
+  buildCard(html) {
+    const template = document.createElement('template');
+    template.innerHTML = html.trim();
+    return template.content.firstElementChild;
   }
 
   /**

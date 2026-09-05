@@ -343,6 +343,34 @@ body {
   border-color: var(--macos-border-highlight);
 }
 
+.panel-clear-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1;
+  border-radius: 50%;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--macos-text-secondary);
+  cursor: pointer;
+  opacity: 0.5;
+  transition: all var(--macos-duration-fast) var(--macos-ease-spring);
+}
+
+.panel-clear-btn:hover {
+  opacity: 1;
+  background: var(--macos-surface-hover);
+  border-color: var(--macos-border-subtle);
+}
+
+.panel-clear-btn:active {
+  transform: scale(0.92);
+}
+
 .convoai-status-pill {
   display: inline-flex;
   align-items: center;
@@ -1202,7 +1230,8 @@ body {
   color: var(--macos-text-secondary);
 }
 
-.macos-segmented-btn.locked {
+.macos-lang-select.locked,
+.macos-lang-select:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }
