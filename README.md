@@ -216,10 +216,66 @@ uv run pytest tests/test_audio.py -v
 uv run python -c "import src.audio.vad_processor, src.audio.stt_transcriber, src.rtc.agora_client; print('All core modules imported successfully')"
 ```
 
-How to run the system:
+### Running the Full System
+
+Each of these runs in its own terminal, started in this order.
+
+**1. ngrok** — tunnels this backend's `:8000` publicly, since Agora's Convo AI Engine
+calls back into `CONVOAI_LLM_BASE_URL` over the public internet and refuses a
+`localhost` value (REQ-11):
 
 ```powershell
 ngrok http 8000
+or
+ngrok http 8000 --url=https://divisive-morally-pardon.ngrok-free.dev
+```
+
+Copy the `https://<subdomain>.ngrok-free.dev` forwarding URL it prints, and set it in
+`.env` before starting the backend:
+
+```ini
+CONVOAI_LLM_BASE_URL=https://your-subdomain.ngrok-free.dev
+```
+
+This URL changes on every `ngrok http` restart on the free tier — update `.env` again
+after each restart, or the backend's own preflight check refuses to start Convo AI
+with a 502 naming the stale URL.
+
+**2. Anki MCP server** — only needed if `ANKI_MCP_URL` is configured, to export a
+session's vocabulary to Anki as flashcards (REQ-19). Requires the Anki desktop app
+running with the [AnkiConnect](https://ankiweb.net/shared/info/2055492159) add-on
+installed (default `127.0.0.1:8765`, no API key):
+
+```powershell
+$env:ANKI_CONNECT_URL = "http://127.0.0.1:8765"
+$env:LOG_LEVEL = "info"
+npx @ankimcp/anki-mcp-server
+```
+
+`LOG_LEVEL` must be set explicitly and lowercase — this server validates it against
+exactly `debug`/`info`/`warn`/`error`, and this project's own `.env` sets
+`LOG_LEVEL=INFO` (uppercase), which fails that check if it leaks into this shell.
+
+By default this listens on `http://127.0.0.1:3000/`. Point `.env` at it, and match its
+tool name (`addNotes`, not this project's `add_notes` default):
+
+```ini
+ANKI_MCP_URL=http://127.0.0.1:3000/
+ANKI_MCP_TOOL_NAME=addNotes
+```
+
+Verify what this server actually exposes before trusting the above — schemas drift
+from READMEs:
+
+```powershell
+curl -X POST http://127.0.0.1:3000/ `
+  -H "Content-Type: application/json" `
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+**3. Backend**:
+
+```powershell
 uv run python -m src.server
 ```
 
