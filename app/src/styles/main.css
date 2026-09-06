@@ -461,6 +461,12 @@ body {
   padding: 14px 18px;
   border-bottom: 1px solid var(--macos-border-subtle);
   background: rgba(255, 255, 255, 0.4);
+  /* The three columns' bottom rules read as one line across the workspace, so the
+     header's height is stated here rather than left to whichever controls a given
+     panel happens to carry: Tandem Breakout has no clear button, and without this its
+     rule sat a pixel above the other two. 22px is the tallest control (.panel-clear-btn)
+     plus the vertical padding and the rule itself, under `box-sizing: border-box`. */
+  min-height: calc(22px + 28px + 1px);
 }
 
 .macos-panel-title {
@@ -506,16 +512,41 @@ body {
    panel no longer keeps a separate list of who is here next to a gauge about them. */
 
 /* 16.3: the session's mode, stated under the subtitles heading. Read-only by design. */
+/* On one line rather than stacked: this is the only panel header carrying a second
+   line, so stacking made the centre column's header taller than the left and right
+   ones and its bottom rule sat lower than theirs across the workspace. */
 .subtitles-heading {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.subtitles-heading .macos-panel-title {
+  flex: none;
+}
+
+/* The trailing controls are fixed-size chips, so they hold their size and their row
+   while the agenda beside them ellipsizes. Without this they shrink below their own
+   content at narrow widths and wrap onto a second line, which puts this header back
+   out of step with the other two - the thing moving the agenda up here fixed. */
+.panel-header-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
 }
 
 .session-agenda {
   font-size: 11px;
   font-weight: 500;
   color: var(--macos-text-secondary);
+  /* The agenda yields before the title does - it is the restatable half of the pair,
+     and the flag pills beside it must not be pushed out of the header. */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Speaking Balance Gauge */
