@@ -121,48 +121,27 @@
       <section class="macos-card-panel" id="panel-peers">
         <div class="macos-panel-header">
           <span class="macos-panel-title">👥 Tandem Breakout</span>
-          <span class="macos-badge-pill" style="font-size: 10px;">2 Active Peers</span>
+          <span class="macos-badge-pill" style="font-size: 10px;" id="peer-count">0 Active Peers</span>
         </div>
         <div class="macos-panel-content">
-          <!-- Peer 1: Kenji -->
-          <div class="peer-card">
-            <div class="peer-avatar">
-              <span>🧑‍🎓</span>
-              <span class="peer-online-dot"></span>
-            </div>
-            <div class="peer-info">
-              <div class="peer-name">Kenji Sato 🇯🇵</div>
-            </div>
-          </div>
-
-          <!-- Peer 2: Aarav -->
-          <div class="peer-card">
-            <div class="peer-avatar">
-              <span>👨‍🎓</span>
-              <span class="peer-online-dot"></span>
-            </div>
-            <div class="peer-info">
-              <div class="peer-name">Aarav Sharma 🇮🇳</div>
-            </div>
-          </div>
-
-          <!-- Speaking Balance Gauge. The bios that used to sit above each peer were
-               fixture text describing nobody; this line explains the one thing on this
-               panel that is a real measurement (REQ-23). -->
-          <p class="balance-explainer">Shows how evenly the conversation is shared between participants.</p>
+          <!-- Speaking Balance gauge (REQ-23). 17.3: the two hardcoded peer cards that
+               used to sit above this are gone - a participant's identity is the label on
+               their own row here, so the panel names each person once, next to the one
+               real measurement it makes about them. 16.6's explainer line went with them.
+               17.4: the rows are built from the `speaking_balance` payload rather than
+               being a fixed two-segment bar, because the backend has computed N-way
+               shares since REQ-23 and only this rendering assumed exactly two. -->
           <div class="speaking-balance-container">
             <div class="balance-header">
               <span>Speaking Balance</span>
-              <span id="balance-status" style="font-size: 11px; color: var(--macos-accent-green); font-weight: 600;">⚖️ Optimal Parity</span>
+              <!-- Matches the empty state the widget paints once it has a payload:
+                   before anyone speaks there is no parity to report, and claiming one
+                   is the "no data looks like a perfect split" mistake REQ-23's
+                   `percentages()` deliberately refuses to make on the server side. -->
+              <span id="balance-status" style="font-size: 11px; color: var(--macos-text-tertiary); font-weight: 600;">⏳ Awaiting Speech</span>
             </div>
-            <div class="balance-progress-bar">
-              <div class="balance-seg-a" id="balance-seg-a" style="width: 50%;"></div>
-              <div class="balance-seg-b" id="balance-seg-b" style="width: 50%;"></div>
-            </div>
-            <div class="balance-legend">
-              <span id="balance-label-a">Kenji: 50%</span>
-              <span id="balance-label-b">Aarav: 50%</span>
-            </div>
+            <div class="balance-rows" id="balance-rows"></div>
+            <p class="balance-empty" id="balance-empty">No one has spoken yet.</p>
           </div>
 
           <!-- REQ-22: camera capture surface. Hidden until the participant turns the

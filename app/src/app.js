@@ -191,10 +191,11 @@ class TandemApp {
     this.topicWidget = new TopicWidget({
       topicTitle: '#topic-title',
       topicPrompt: '#topic-prompt',
-      segA: '#balance-seg-a',
-      segB: '#balance-seg-b',
-      labelA: '#balance-label-a',
-      labelB: '#balance-label-b',
+      // 17.4: one row per participant, built from the payload, in place of the two
+      // fixed segments and the two fixed legend labels this used to address by id.
+      rows: '#balance-rows',
+      emptyHint: '#balance-empty',
+      peerCount: '#peer-count',
       statusText: '#balance-status'
     });
     this.teacherBar = new TeacherBar({
@@ -1136,17 +1137,33 @@ class TandemApp {
    * The panel is not updated optimistically: the server answers with `note.deleted` over
    * the data stream, and letting that single path drive the UI keeps every viewer of the
    * session in agreement about what was removed.
+   *
+   * D-17-1: every failure used to be swallowed into a `console.warn`, so whenever the
+   * backend refused the request the card simply stayed and the button read as dead - the
+   * reported "delete does not work". Two ordinary paths reach that refusal, and neither
+   * is an error the person clicking can do anything about: a note still on screen after
+   * the session ended (its channel no longer resolves to a governed session) and the
+   * offline/simulated notes that were never stored at all. Both answer 404, and 404 on a
+   * DELETE means the note is not there - which is exactly the state that was asked for -
+   * so the card goes. Anything else is a real failure and is now said out loud instead of
+   * leaving the button silently inert.
    */
   async deleteNote(noteId) {
+    const url = `/api/session/notes/${encodeURIComponent(noteId)}`
+      + `?channel=${encodeURIComponent(this.channelName)}`
+      + `&actor=${encodeURIComponent(this.speakerId)}`;
+
     try {
-      const url = `/api/session/notes/${encodeURIComponent(noteId)}`
-        + `?channel=${encodeURIComponent(this.channelName)}`
-        + `&actor=${encodeURIComponent(this.speakerId)}`;
       const body = await requestJson(url, { method: 'DELETE' });
       // Offline and simulated sessions never receive the RTC event, so reflect it here.
       this.notesPanel.remove(body);
     } catch (err) {
+      if (err.status === 404) {
+        this.notesPanel.remove({ note: { id: noteId } });
+        return;
+      }
       console.warn('Could not delete the note:', err.message);
+      this.referenceCard.renderNotice('Delete Note', err.message, false);
     }
   }
 

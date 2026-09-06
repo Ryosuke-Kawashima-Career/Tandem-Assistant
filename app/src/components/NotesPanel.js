@@ -46,6 +46,9 @@ export class NotesPanel {
     this.emptyHint = document.querySelector(options.emptyHint || '#notes-empty-hint');
     this.countBadge = document.querySelector(options.countBadge || '#notes-count');
     this.notes = new Map();
+    // id -> signature of the card currently rendered for it (D-17-2). Held here rather
+    // than on the element, so the note text is not duplicated into a DOM attribute.
+    this.signatures = new Map();
     this.onDelete = null;
 
     // Delegated rather than bound per card: the list is redrawn on every event, and
@@ -100,9 +103,9 @@ export class NotesPanel {
    * Algorithm:
    * 1. Toggle the empty-state hint and the count badge.
    * 2. Diff the desired note order against the cards already in the DOM, keyed by
-   *    `data-note-id`: build a card only for a note that is new or whose rendered
-   *    markup changed, reuse the existing element otherwise, and drop cards whose
-   *    note is gone.
+   *    `data-note-id`: build a card only for a note that is new or whose signature
+   *    changed, reuse the existing element otherwise, and drop cards whose note is
+   *    gone.
    * 3. Reorder the surviving elements in place to match newest-first.
    *
    * Keyed rather than a blanket `innerHTML` rebuild: the panel is redrawn on every
@@ -111,6 +114,15 @@ export class NotesPanel {
    * changed - the whole list flashing every few seconds. Reusing an unchanged note's
    * element leaves its animation finished and untouched, so the entrance now marks what
    * it is supposed to mark: a note that genuinely just arrived.
+   *
+   * D-17-2: that diff compared `outerHTML` against `renderCard`'s markup, which is not
+   * the same string even for an untouched note. `renderCard` escapes `'` to `&#39;`,
+   * `"` to `&quot;` and `&` to `&amp;` in text positions, where the DOM serializes them
+   * back as the literal characters - so every note containing an apostrophe compared
+   * unequal and was rebuilt on every render, replaying the entrance on every 5s poll.
+   * Note text is transcribed speech, so apostrophes are the common case and 15.6's fix
+   * effectively never held. The comparison now runs on `cardSignature`, built from the
+   * note's own fields, and never round-trips through markup.
    */
   render() {
     if (!this.container) return;
@@ -128,23 +140,27 @@ export class NotesPanel {
     });
 
     const elements = ordered.map((note) => {
-      const html = this.renderCard(note);
+      const signature = this.cardSignature(note);
       const current = existing.get(String(note.id));
       if (current) {
         existing.delete(String(note.id));
-        // Compared as markup rather than by a revision field: the note contract has no
-        // version, and re-rendering a card whose text is identical is exactly the
+        // Compared by signature rather than by a revision field: the note contract has
+        // no version, and re-rendering a card whose content is identical is exactly the
         // needless entrance replay this method exists to avoid.
-        if (current.outerHTML.trim() === html.trim()) return current;
-        const replacement = this.buildCard(html);
+        if (this.signatures.get(String(note.id)) === signature) return current;
+        const replacement = this.buildCard(this.renderCard(note));
         if (replacement) {
           current.replaceWith(replacement);
           return replacement;
         }
         return current;
       }
-      return this.buildCard(html);
+      return this.buildCard(this.renderCard(note));
     }).filter(Boolean);
+
+    // Recorded only after the cards are settled, so a signature can never claim a card
+    // that failed to build.
+    this.signatures = new Map(ordered.map((note) => [String(note.id), this.cardSignature(note)]));
 
     // Anything left in `existing` belongs to a note that was deleted.
     existing.forEach((el) => el.remove());
@@ -152,6 +168,22 @@ export class NotesPanel {
     // Step 3: put the cards in order. `append` moves an element already in the
     // container rather than cloning it, so a reused card keeps its finished animation.
     elements.forEach((el) => this.container.append(el));
+  }
+
+  /**
+   * Builds the value that decides whether a rendered card is still current.
+   *
+   * Every field `renderCard` reads, joined by a separator that cannot appear in a note
+   * id or type, so a change in any of them - and only in one of them - rebuilds the
+   * card. JSON rather than a joined string, so a field ending where the next begins
+   * cannot forge another note's signature. Deliberately computed from the note object
+   * rather than from its markup: the markup round-trip is what D-17-2 broke on.
+   *
+   * @param {Object} note - Serialized NoteItem
+   * @returns {string} A stable signature for the note's rendered content
+   */
+  cardSignature(note) {
+    return JSON.stringify([note.type, note.status, note.text, note.owner, note.due_at]);
   }
 
   /**

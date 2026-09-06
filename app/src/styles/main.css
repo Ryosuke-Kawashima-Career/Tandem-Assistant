@@ -501,67 +501,9 @@ body {
 /* ==========================================================================
    6. Left Panel: Peer Learners & Topic Widget
    ========================================================================== */
-.peer-card {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  background: rgba(255, 255, 255, 0.6);
-  border: 1px solid var(--macos-border-subtle);
-  border-radius: 14px;
-  padding: 12px 14px;
-  transition: transform var(--macos-duration-fast) var(--macos-ease-spring);
-}
-
-.peer-card:hover {
-  background: rgba(255, 255, 255, 0.9);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
-  transform: translateY(-1px);
-}
-
-.peer-avatar {
-  width: 42px;
-  height: 42px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 20px;
-  background: #ffffff;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
-  position: relative;
-}
-
-.peer-online-dot {
-  position: absolute;
-  bottom: 0;
-  right: 0;
-  width: 10px;
-  height: 10px;
-  background-color: var(--macos-accent-green);
-  border: 2px solid #ffffff;
-  border-radius: 50%;
-}
-
-.peer-info {
-  flex: 1;
-}
-
-.peer-name {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--macos-text-primary);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
-/* 16.6: one line explaining the gauge, in place of the per-peer bio fixtures. */
-.balance-explainer {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.4;
-  color: var(--macos-text-secondary);
-}
+/* 17.3 removed `.peer-card` and its avatar/name/online-dot parts, along with 16.6's
+   `.balance-explainer`: a participant is now named on their own balance row, so the
+   panel no longer keeps a separate list of who is here next to a gauge about them. */
 
 /* 16.3: the session's mode, stated under the subtitles heading. Read-only by design. */
 .subtitles-heading {
@@ -596,31 +538,82 @@ body {
   color: var(--macos-text-secondary);
 }
 
-.balance-progress-bar {
-  height: 10px;
+/* 17.4: one row per participant, replacing the single two-segment bar and its
+   two-label legend. The row carries the participant's identity (17.3), so the width
+   of a bar and the name beside it are read together rather than cross-referenced. */
+.balance-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.balance-row {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.balance-row-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.balance-row-avatar {
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.balance-row-name {
+  flex: 1;
+  font-weight: 600;
+  color: var(--macos-text-primary);
+  /* A speaker name comes from the session, not from a fixture, so it can be long. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.balance-row-pct {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--macos-text-secondary);
+}
+
+.balance-row-track {
+  height: 8px;
   border-radius: 9999px;
   background: rgba(0, 0, 0, 0.06);
-  display: flex;
   overflow: hidden;
   box-shadow: var(--macos-inner-shadow);
 }
 
-.balance-seg-a {
-  background: linear-gradient(90deg, #007aff, #30b0c7);
+.balance-row-fill {
+  height: 100%;
+  border-radius: 9999px;
   transition: width 0.5s var(--macos-ease-spring);
 }
 
-.balance-seg-b {
-  background: linear-gradient(90deg, #ff9500, #ff3b30);
-  transition: width 0.5s var(--macos-ease-spring);
-}
-
-.balance-legend {
-  display: flex;
-  justify-content: space-between;
-  font-size: 11px;
-  font-weight: 500;
+.balance-empty {
+  margin: 0;
+  font-size: 12px;
   color: var(--macos-text-tertiary);
+}
+
+/* Scoped like every other `.hidden` here (`.notes-empty`, `.camera-panel`, ...): this
+   stylesheet has no global `.hidden`, so a component that wants one declares it. */
+.balance-empty.hidden {
+  display: none;
 }
 
 /* Topic Card */
