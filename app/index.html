@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EchoSphere — Tandem Co-Teacher</title>
+  <title>Fluency Copilot</title>
   <link rel="stylesheet" href="./src/styles/main.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌐</text></svg>">
 </head>
@@ -12,22 +12,17 @@
     <!-- 1. macOS Window Header -->
     <header class="macos-window-header">
       <div class="macos-header-title">
-        <span>🌐 EchoSphere</span>
-        <span style="font-weight: 400; color: var(--macos-text-secondary);">—</span>
-        <span>Fluency Co-pilot</span>
+        <span>Fluency Copilot</span>
       </div>
 
       <div class="macos-header-status">
-        <!-- Session mode (REQ-12). Immutable once a session starts, so the backend
-             rejects a mid-session switch and these buttons disable while one is live. -->
-        <select class="macos-lang-select" id="mode-select"
-                title="Session mode - fixed once the session starts">
-          <option value="language_learning">🎓 Language Learning</option>
-          <option value="international_work">🌏 International Work</option>
-        </select>
+        <!-- Session mode (REQ-12) is no longer a standing control: it is asked once,
+             at Join, by #mode-modal-overlay below. A selector that is disabled for the
+             whole session is a control in name only, and it read as one that had failed.
+             The chosen mode is echoed as read-only agenda text in the Subtitles panel. -->
 
         <!-- Joining and muting are the two controls a participant reaches for before
-             anything else, so they sit in the config bar rather than among the tools. -->
+             anything else, so they lead the header. -->
         <button class="macos-action-btn primary" id="btn-join">
           <span id="btn-join-icon">📞</span>
           <span id="btn-join-text">Join</span>
@@ -53,11 +48,12 @@
           <span id="convoai-status-text">AI Co-Teacher Idle</span>
         </div>
       </div>
-    </header>
 
-    <!-- 2. macOS Floating Pill Toolbar -->
-    <div class="macos-toolbar-container">
-      <div class="macos-pill-toolbar">
+      <!-- Every session tool, in the same header as the session controls. The separate
+           floating pill bar is gone: two bars of controls read as two levels of
+           importance, and nothing about "Research" or "Export" is subordinate to
+           "Mute". `flex-wrap` in main.css is what lets one row hold the whole set. -->
+      <div class="macos-header-tools">
         <button class="macos-action-btn convoai" id="btn-convoai" title="Start a live spoken conversation with the AI co-teacher">
           <span id="btn-convoai-icon">🤖</span>
           <span id="btn-convoai-text">Talk to AI</span>
@@ -117,7 +113,7 @@
           <span>Export Session</span>
         </button>
       </div>
-    </div>
+    </header>
 
     <!-- 3. Main 3-Column macOS Workspace -->
     <main class="macos-workspace-grid">
@@ -136,7 +132,6 @@
             </div>
             <div class="peer-info">
               <div class="peer-name">Kenji Sato 🇯🇵</div>
-              <div class="peer-role">Native: Japanese • Learning: Hindi / EN</div>
             </div>
           </div>
 
@@ -148,11 +143,13 @@
             </div>
             <div class="peer-info">
               <div class="peer-name">Aarav Sharma 🇮🇳</div>
-              <div class="peer-role">Native: Hindi • Learning: Japanese / EN</div>
             </div>
           </div>
 
-          <!-- Speaking Balance Gauge -->
+          <!-- Speaking Balance Gauge. The bios that used to sit above each peer were
+               fixture text describing nobody; this line explains the one thing on this
+               panel that is a real measurement (REQ-23). -->
+          <p class="balance-explainer">Shows how evenly the conversation is shared between participants.</p>
           <div class="speaking-balance-container">
             <div class="balance-header">
               <span>Speaking Balance</span>
@@ -191,12 +188,14 @@
             </button>
           </div>
 
-          <!-- The scripted dialogue preview lives beside the topic it rewrites, not in
-               the tool bar: it is a demo of this panel, not a session control. -->
+          <!-- Sits beside the topic it rewrites. In a live session this asks the
+               backend for a real topic - the same generator the automatic silence
+               rotation uses (REQ-27) - and falls back to the scripted offline preview
+               when there is no session to ask. -->
           <button class="macos-action-btn" id="btn-simulation" style="width: 100%;"
-                  title="Replay a scripted tri-lingual dialogue to preview the UI offline">
+                  title="Ask the co-teacher for a new conversation topic">
             <span>✨</span>
-            <span>Simulate Tandem Dialogue</span>
+            <span>Generate Topics</span>
           </button>
 
           <!-- Active Conversational Topic -->
@@ -211,7 +210,13 @@
       <!-- Center Column: Live Subtitles Stream -->
       <section class="macos-card-panel" id="panel-subtitles">
         <div class="macos-panel-header">
-          <span class="macos-panel-title">💬 Live Tri-Lingual Subtitles</span>
+          <div class="subtitles-heading">
+            <span class="macos-panel-title">💬 Live Tri-Lingual Subtitles</span>
+            <!-- The session mode, stated rather than offered (16.2/16.3). Display only:
+                 REQ-12 fixes the mode for the session's life, so the place it belongs is
+                 where a participant reads what this session is, not among the controls. -->
+            <span class="session-agenda" id="session-agenda">Agenda: Language Learning practice</span>
+          </div>
           <div style="display: flex; gap: 6px; align-items: center;">
             <span class="lang-flag-pill">🇯🇵 JA</span>
             <span class="lang-flag-pill">🇮🇳 HI</span>
@@ -329,6 +334,30 @@
       <div class="modal-actions">
         <button class="macos-action-btn" id="prompt-modal-cancel">Cancel</button>
         <button class="macos-action-btn primary" id="prompt-modal-ok">OK</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Session mode chooser (REQ-12, 16.2). Asked once, at the first Join of a session,
+       because the mode is immutable for that session's life: a standing selector that is
+       disabled the entire time it matters is a control in name only. Not the text
+       prompt above - this is a choice between two named things, not a free string. -->
+  <div class="modal-overlay hidden" id="mode-modal-overlay">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="mode-modal-title">
+      <div class="modal-title" id="mode-modal-title">What is this session for?</div>
+      <div class="modal-message">
+        This decides the assistance you get and how notes are written. It is fixed for the
+        rest of the session.
+      </div>
+      <div class="modal-choices">
+        <button class="macos-action-btn primary mode-choice" data-mode="language_learning">
+          <span>🎓</span>
+          <span>Language Learning</span>
+        </button>
+        <button class="macos-action-btn mode-choice" data-mode="international_work">
+          <span>🌏</span>
+          <span>International Work</span>
+        </button>
       </div>
     </div>
   </div>

@@ -1164,11 +1164,19 @@ class TandemApp {
     this.currentMode = mode === 'international_work' ? 'international_work' : 'language_learning';
     const isLearning = this.currentMode === 'language_learning';
 
+    // 16.5: this title no longer follows the mode. "Terms, Intent & Clarifications"
+    // named the same panel, showing the same quiz and insight cards, under a heading
+    // that matched neither - so the label moved while the content did not.
     const scaffoldingTitle = document.getElementById('scaffolding-title');
-    if (scaffoldingTitle) {
-      scaffoldingTitle.textContent = isLearning
-        ? '✨ Quiz & Insights'
-        : '✨ Terms, Intent & Clarifications';
+    if (scaffoldingTitle) scaffoldingTitle.textContent = '✨ Quiz & Insights';
+
+    // 16.3: the mode is stated where a participant reads what this session is. Display
+    // only - with the selector gone (16.2) this is the sole place the choice is visible.
+    const agenda = document.getElementById('session-agenda');
+    if (agenda) {
+      agenda.textContent = isLearning
+        ? 'Agenda: Language Learning practice'
+        : 'Agenda: International Work session';
     }
 
     const notesTitle = document.getElementById('notes-title');
@@ -1293,16 +1301,63 @@ class TandemApp {
   }
 
   /**
-   * Locks or releases the mode switcher.
+   * Asks which kind of session this is, once, before the first join (REQ-12, 16.2).
    *
-   * The backend is the authority - it rejects a mid-session mode change with a 400 -
-   * so this only stops the user from making a request that is guaranteed to fail.
+   * Algorithm:
+   * 1. A session already chosen for keeps its mode - REQ-12 fixes it for the session's
+   *    life, so there is nothing to ask a second time.
+   * 2. Otherwise present the two modes and wait for one to be picked.
+   * 3. Cancelling (Escape, or clicking the backdrop) abandons the join rather than
+   *    silently defaulting: a defaulted mode produces a session whose notes and
+   *    assistance quietly do not match what the participant came for.
+   *
+   * Replaces the header selector, which was disabled for the entire time the mode
+   * actually mattered - a control that only accepts input when the answer cannot
+   * matter yet.
+   *
+   * @returns {Promise<boolean>} whether a mode was chosen and the join may proceed.
    */
-  setModeSwitcherLocked(locked) {
-    const select = document.getElementById('mode-select');
-    if (!select) return;
-    select.disabled = locked;
-    select.classList.toggle('locked', locked);
+  async chooseSessionMode() {
+    if (this.modeChosen) return true;
+
+    const overlay = document.getElementById('mode-modal-overlay');
+    if (!overlay) {
+      // No chooser in the DOM: fall back to the mode already in force rather than
+      // refusing to join over a missing dialog.
+      this.modeChosen = true;
+      return true;
+    }
+
+    const chosen = await new Promise((resolve) => {
+      const buttons = Array.from(overlay.querySelectorAll('.mode-choice'));
+      overlay.classList.remove('hidden');
+      buttons[0]?.focus();
+
+      const cleanup = (mode) => {
+        overlay.classList.add('hidden');
+        buttons.forEach((btn) => btn.removeEventListener('click', onPick));
+        overlay.removeEventListener('click', onBackdrop);
+        document.removeEventListener('keydown', onKeydown);
+        resolve(mode);
+      };
+      const onPick = (event) => cleanup(event.currentTarget.dataset.mode);
+      const onBackdrop = (event) => {
+        if (event.target === overlay) cleanup(null);
+      };
+      const onKeydown = (event) => {
+        if (event.key === 'Escape') cleanup(null);
+      };
+
+      buttons.forEach((btn) => btn.addEventListener('click', onPick));
+      overlay.addEventListener('click', onBackdrop);
+      document.addEventListener('keydown', onKeydown);
+    });
+
+    if (!chosen) return false;
+
+    this.setSessionMode(chosen);
+    this.modeChosen = true;
+    return true;
   }
 
   /**
@@ -1327,23 +1382,10 @@ class TandemApp {
    * Binds DOM event listeners for toolbar actions, mode switching, and simulations.
    */
   bindDomEvents() {
-    // Session mode switcher (REQ-12). The mode decides which assistance the backend
-    // runs and which note vocabulary it may emit, and it cannot change mid-session -
+    // Session mode (REQ-12). No standing control any more: `chooseSessionMode()` asks
+    // once at the first Join (16.2), because the mode cannot change mid-session -
     // artifacts already generated under the first mode would contradict the second.
-    const modeSelect = document.getElementById('mode-select');
-    if (modeSelect) {
-      modeSelect.value = this.currentMode;
-      modeSelect.addEventListener('change', () => {
-        if (this.isAiActive || this.isAiPending) {
-          console.warn('Session mode is fixed while a conversation is live. End it first.');
-          // The selector is disabled while a conversation is live, so this only runs if
-          // that lock was bypassed; put the control back on the mode actually in force.
-          modeSelect.value = this.currentMode;
-          return;
-        }
-        this.setSessionMode(modeSelect.value);
-      });
-    }
+    // This call paints the mode currently in force, including the agenda line.
     this.setSessionMode(this.currentMode);
 
     // Export the stored session (REQ-15 / REQ-19). One control, one destination
@@ -1434,7 +1476,7 @@ class TandemApp {
     // Simulation Demo Trigger
     const btnSim = document.getElementById('btn-simulation');
     if (btnSim) {
-      btnSim.addEventListener('click', () => this.runSimulationDemo());
+      btnSim.addEventListener('click', () => this.generateTopics());
     }
 
     // Panel-scoped clears (REQ-25). Each one empties the panel it sits in and nothing
@@ -1645,6 +1687,9 @@ class TandemApp {
       console.warn('Could not stop the backend session:', err.message);
     }
     this.sessionId = null;
+    // 16.2: the mode belongs to the session that just ended, so the next join asks
+    // again rather than silently inheriting a choice made for a different conversation.
+    this.modeChosen = false;
   }
 
   /**
@@ -1727,6 +1772,14 @@ class TandemApp {
     const connDot = document.getElementById('connection-dot');
 
     if (!this.isJoined) {
+      // 16.2: the mode is asked here, once, because this is the moment it starts to
+      // bind - `startSession()` below sends it and REQ-12 fixes it from then on.
+      // Declining the chooser abandons the join rather than defaulting the mode.
+      if (!await this.chooseSessionMode()) {
+        console.log('ℹ️ Join cancelled: no session mode chosen.');
+        return;
+      }
+
       // Declared outside the try because the catch below is a real join path too - a
       // participant whose microphone fails still joins and still needs live events -
       // and it cannot subscribe without these credentials.
@@ -2010,7 +2063,6 @@ class TandemApp {
     this.updateConvoAIUi('starting');
 
     try {
-      this.setModeSwitcherLocked(true);
       const agent = await this.convoai.startAgent(language, this.currentMode, this.speakerId);
       console.log('🤖 Convo AI agent accepted:', agent);
 
@@ -2060,8 +2112,7 @@ class TandemApp {
     await this.stopTranslationLegs();
     this.isAiActive = false;
     this.isAiPending = false;
-    // The session is over, so its mode is no longer binding: the next one may differ.
-    this.setModeSwitcherLocked(false);
+    // The mode is re-armed by `stopSession()`, which owns the session's lifetime.
     this.teacherBar.setVisible(false);
     this.updateConvoAIUi(reason ? 'error' : 'idle', reason);
 
@@ -2139,6 +2190,44 @@ class TandemApp {
       pill.title = state === 'error' ? detail : '';
     }
     if (pillText) pillText.textContent = config.pill;
+  }
+
+  /**
+   * Asks the co-teacher for a new conversation topic (REQ-27, 16.7).
+   *
+   * Algorithm:
+   * 1. With a live session, ask the backend. The published `topic_prompt` repaints the
+   *    topic card through the same stream handler the automatic rotation uses.
+   * 2. With no session, fall back to the scripted offline preview.
+   *
+   * Step 1 is what the rename is about. "Simulate Tandem Dialogue" only ever cycled the
+   * four-item `SIMULATION_TOPICS` fixture, so the topic a participant asked for and the
+   * topic the co-teacher offers on a silence came from two unrelated sources; one
+   * endpoint makes the manual and automatic paths one feature.
+   */
+  async generateTopics() {
+    if (!this.sessionId) {
+      this.runSimulationDemo();
+      return;
+    }
+
+    const btn = document.getElementById('btn-simulation');
+    if (btn) btn.disabled = true;
+    try {
+      const body = await requestJson('/api/session/topic/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ channel: this.channelName, actor: this.speakerId })
+      });
+      // The topic reaches every participant over the data stream, so the card is only
+      // painted here when this client is not subscribed to one (the simulated path).
+      if (!this.isJoined && body?.topic) this.topicWidget.updateTopic(body.topic);
+      console.log('🎯 New conversation topic generated.');
+    } catch (err) {
+      console.error('Could not generate a topic:', err.message);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   }
 
   /**

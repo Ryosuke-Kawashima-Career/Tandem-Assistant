@@ -20,10 +20,21 @@ Key Classes:
 """
 
 import logging
+import os
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("echosphere.sessions.speaking_balance")
+
+# Share below which a participant counts as being left out of the conversation (REQ-26).
+# A floor rather than a trigger: at 25% a pair is merely uneven, and a trio is exactly
+# even, so the nudge is reserved for someone measurably further behind than that.
+DEFAULT_NUDGE_THRESHOLD_PCT = 25
+
+# How much speech must be on record before a share means anything (REQ-26). Ten seconds
+# into a conversation somebody is always "behind", because somebody has to speak first;
+# nudging on that measures who opened the call, not who is being left out.
+DEFAULT_NUDGE_MIN_TOTAL_MS = 60000
 
 
 class SpeakingBalanceTracker:
@@ -35,16 +46,56 @@ class SpeakingBalanceTracker:
     lock loses segments under exactly the load that makes the gauge worth watching.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        nudge_threshold_pct: int = DEFAULT_NUDGE_THRESHOLD_PCT,
+        nudge_min_total_ms: int = DEFAULT_NUDGE_MIN_TOTAL_MS
+    ):
         """
         Initialize an empty tracker.
 
         Algorithm:
         1. Create the channel -> {speaker -> milliseconds} table.
         2. Create the lock guarding it against concurrent recording.
+        3. Record the REQ-26 nudge thresholds and the per-channel suppression set that
+           keeps an automatic nudge from repeating on every recorded segment.
         """
         self._durations: Dict[str, Dict[str, int]] = {}
         self._lock = threading.Lock()
+        self.nudge_threshold_pct = int(nudge_threshold_pct)
+        self.nudge_min_total_ms = int(nudge_min_total_ms)
+        # channel -> speakers already nudged and not yet recovered (REQ-26).
+        self._nudged: Dict[str, Set[str]] = {}
+
+    @classmethod
+    def from_env(cls) -> "SpeakingBalanceTracker":
+        """
+        Builds a tracker whose REQ-26 thresholds come from the environment.
+
+        `SPEAKING_BALANCE_NUDGE_THRESHOLD_PCT` and `SPEAKING_BALANCE_NUDGE_MIN_MS` are
+        the documented tuning surface. A typo falls back to the default rather than to
+        zero: an unparseable minimum window that became `0` would nudge somebody two
+        seconds into their first conversation, which is a worse failure than the
+        misconfiguration behind it.
+        """
+        def read(name: str, default: int) -> int:
+            raw = os.getenv(name, "")
+            try:
+                return int(raw) if raw else default
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"{name}={raw!r} is not an integer. Using the default {default}."
+                )
+                return default
+
+        return cls(
+            nudge_threshold_pct=read(
+                "SPEAKING_BALANCE_NUDGE_THRESHOLD_PCT", DEFAULT_NUDGE_THRESHOLD_PCT
+            ),
+            nudge_min_total_ms=read(
+                "SPEAKING_BALANCE_NUDGE_MIN_MS", DEFAULT_NUDGE_MIN_TOTAL_MS
+            )
+        )
 
     def record(self, channel: str, speaker_id: str, duration_ms: int) -> Dict[str, int]:
         """
@@ -124,6 +175,66 @@ class SpeakingBalanceTracker:
 
         return shares
 
+    def quietest_speaker(self, channel: str) -> Optional[str]:
+        """
+        Returns who is measurably being left out, without consuming anything (REQ-26).
+
+        Same judgement as `nudge_candidate` - the threshold, the minimum measured window,
+        and the refusal to call a lone speaker an imbalance - but as a pure read. Two
+        callers need this answer for different reasons: the nudge fires once and must
+        suppress itself, while REQ-27's topic generator only wants to know who to address
+        and must not silently eat the other feature's one-shot.
+        """
+        percentages = self.percentages(str(channel))
+        if self.total_ms(str(channel)) < self.nudge_min_total_ms or len(percentages) < 2:
+            return None
+
+        speaker, share = min(percentages.items(), key=lambda item: (item[1], item[0]))
+        return speaker if share < self.nudge_threshold_pct else None
+
+    def nudge_candidate(self, channel: str) -> Optional[str]:
+        """
+        Nominates the participant who should be nudged to speak, once (REQ-26).
+
+        Algorithm:
+        1. Refuse to judge a conversation that has not been measured long enough.
+        2. Refuse to judge a channel with a single measured speaker.
+        3. Take the lowest share; if it is below the threshold and that speaker is not
+           already under suppression, nominate them and suppress further nominations.
+        4. Whether or not anyone is nominated, release suppression for everybody now back
+           at or above the threshold, so the cue re-arms when it has actually worked.
+
+        Steps 1-2 are the difference between a facilitation cue and an accusation. With
+        one speaker on record there is no share to be low *relative to* - the other
+        person may not have joined yet - and inside the first minute the "quiet" one is
+        usually just the person who did not open the call.
+
+        Step 3's suppression is why this is a method rather than an inline comparison in
+        the server: `record()` runs on every measured segment, so an unsuppressed check
+        would publish a `teacher_alert` several times a minute at exactly the moment
+        somebody is already struggling to get a word in.
+        """
+        key = str(channel)
+        # Both reads happen before the lock is taken: they acquire it themselves, and
+        # `threading.Lock` is not reentrant.
+        percentages = self.percentages(key)
+        candidate = self.quietest_speaker(key)
+
+        with self._lock:
+            nudged = self._nudged.setdefault(key, set())
+
+            # Step 4 first: recovery is re-armed even in the runs that nominate nobody,
+            # since the usual reason nobody is nominated is that everybody recovered.
+            for speaker, share in percentages.items():
+                if share >= self.nudge_threshold_pct:
+                    nudged.discard(speaker)
+
+            if candidate is None or candidate in nudged:
+                return None
+
+            nudged.add(candidate)
+            return candidate
+
     def reset(self, channel: Optional[str] = None) -> None:
         """
         Clears one channel's tally, or every channel when none is named.
@@ -136,5 +247,9 @@ class SpeakingBalanceTracker:
         with self._lock:
             if channel is None:
                 self._durations.clear()
+                self._nudged.clear()
             else:
                 self._durations.pop(str(channel), None)
+                # The suppression goes with the tally: a new session on this channel may
+                # nudge, even about the same person the last one already nudged.
+                self._nudged.pop(str(channel), None)

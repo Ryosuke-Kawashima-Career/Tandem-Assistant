@@ -613,6 +613,8 @@ Target Language: {target_language}
 Native Language: {native_language}
 {target_clause}
 
-Generate an engaging, open-ended discussion prompt to restart the conversation. Return output strictly in the standard JSON schema.
+Generate an engaging, open-ended discussion prompt to restart the conversation. Return output strictly in the standard JSON schema, plus ONE extra top-level field:
+  "topic_title": a short English label for the topic, at most six words, with no trailing punctuation (e.g. "Comfort Food on a Busy Day").
+The topic card shows this label above the question, so it must be a heading rather than a restatement of the question itself.
 """
     return prompt.strip()

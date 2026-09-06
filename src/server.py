@@ -55,6 +55,7 @@ from src.artifacts.repository import LocalArtifactRepository, configured_retenti
 from src.sessions.models import InvalidSessionModeError, SessionMode, SessionRecord
 from src.sessions.service import SessionNotFoundError, SessionService
 from src.sessions.speaking_balance import SpeakingBalanceTracker
+from src.sessions.silence_monitor import SilenceMonitor
 from src.translation.router import Participant, TranslationRouter
 from src.rtc.convoai_client import (
     ConvoAIClient,
@@ -170,7 +171,15 @@ class EchoSphereServer:
         # Measured speaking time per channel (REQ-23). Separate from the session record
         # because it is a running tally updated from whichever thread noticed a speech
         # boundary, while a session's identity and mode are decided once.
-        self.speaking_balance = SpeakingBalanceTracker()
+        self.speaking_balance = SpeakingBalanceTracker.from_env()
+
+        # Per-channel silence window for the automatic topic rotation (REQ-27). Reads the
+        # same measured VAD/turn boundary REQ-23 counts rather than a signal of its own -
+        # a facilitator that fires on something nobody produced is a timer wearing a
+        # measurement's clothes, which is the failure REQ-23 was written to remove.
+        self.silence_monitor = SilenceMonitor.from_env()
+        self._silence_watcher: Optional[threading.Thread] = None
+        self._silence_watcher_lock = threading.Lock()
 
         # Session artifacts (REQ-13 / REQ-14). Generation is driven from the finalized
         # turn, off the voice-critical path, and publishes quiz.created / note.upserted
@@ -309,6 +318,10 @@ class EchoSphereServer:
         # REQ-23: for the same reason the agent's state is reset - the channel is reused,
         # the session is not, and a new learner must not be shown the previous one's share.
         self.speaking_balance.reset(channel)
+        # REQ-27: a Convo AI session is a live conversation on this channel too, so its
+        # silence is worth facilitating - and its window starts now, not at the last
+        # ambient session's last word.
+        self.silence_monitor.start(channel)
         logger.info(
             f"Convo AI session context registered for channel '{channel}' "
             f"(language: {language}, speaker: {speaker_id}, mode: {session.mode.value})."
@@ -320,6 +333,7 @@ class EchoSphereServer:
         Drops the session context for a channel and resets conversation state (REQ-LLM-05).
         """
         self.convoai_session_context.pop(channel, None)
+        self.silence_monitor.stop(channel)
         closed = self.sessions.end_session(channel)
         if closed is not None:
             # Stamp the stored artifact with the end time; it outlives the session.
@@ -527,7 +541,165 @@ class EchoSphereServer:
 
         if self.speaking_balance.total_ms(channel) > recorded_before:
             self.data_stream.send_speaking_balance(percentages)
+            # REQ-27: measured speech is what keeps the room "alive". Only a segment that
+            # actually counted postpones the rotation - a rejected one is not evidence
+            # anybody spoke.
+            self.silence_monitor.note_activity(channel)
+            # REQ-26: the same recomputation decides whether anyone is being left out.
+            self.publish_balance_nudge(channel, percentages)
         return percentages
+
+    def publish_balance_nudge(
+        self,
+        channel: str,
+        percentages: Optional[Dict[str, int]] = None
+    ) -> Optional[str]:
+        """
+        Publishes one automatic speaking-balance nudge, if one is due (REQ-26).
+
+        Algorithm:
+        1. Ask the tracker whether a participant is measurably being left out. It owns
+           the threshold, the minimum window, and the one-shot suppression.
+        2. Publish a `teacher_alert` naming that participant, and return the name.
+
+        Deliberately not implemented by invoking the teacher dock's `nudge_turn` handler:
+        that control is a frontend fixture that dispatches a hardcoded local message to
+        a hardcoded name and never reaches a server. REQ-26 is the opposite of it -
+        server-side detection over measured signal, addressed to whoever is actually
+        quiet, published to the room over the real data stream.
+        """
+        candidate = self.speaking_balance.nudge_candidate(channel)
+        if not candidate:
+            return None
+
+        shares = percentages if percentages is not None else self.speaking_balance.percentages(channel)
+        share = shares.get(candidate, 0)
+        self.data_stream.send_teacher_alert(
+            f"{candidate} has spoken for {share}% of this conversation. "
+            f"Invite them into the next turn.",
+            severity="warning"
+        )
+        logger.info(
+            f"REQ-26 speaking-balance nudge published for '{candidate}' "
+            f"({share}%) on channel '{channel}'."
+        )
+        return candidate
+
+    def generate_topic(
+        self,
+        channel: str,
+        inactive_speaker: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Generates one conversation topic and publishes it to the channel (REQ-27).
+
+        Algorithm:
+        1. Aim the prompt at whoever the measurement says is quiet, unless told otherwise.
+        2. Ask `TeachingAgent.generate_silence_breaker()` for the intervention.
+        3. Publish it as the `topic_prompt` / `teacher_alert` shapes the widgets already
+           render, and postpone the silence window so an on-demand topic is not
+           immediately replaced by an automatic one.
+
+        The single generator is the point: before this, the manual path cycled a
+        four-item frontend fixture while the automatic path did not exist, so the two
+        would have disagreed about what a topic even is.
+        """
+        # A non-consuming read: asking here must not silently eat REQ-26's one-shot
+        # nudge, which is a separate cue with its own suppression.
+        target = inactive_speaker or self.speaking_balance.quietest_speaker(channel)
+        result = self.agent.generate_silence_breaker(inactive_speaker=target)
+
+        subtitles = result.get("subtitles") or {}
+        topic_title = (
+            result.get("topic_title")
+            or subtitles.get("translation_en")
+            or result.get("spoken_response", "")
+        )
+        prompt = result.get("prompt") or result.get("spoken_response", "")
+
+        self.data_stream.send_topic(topic_title, prompt)
+        alert = result.get("teacher_alert") or {}
+        self.data_stream.send_teacher_alert(
+            alert.get("message") or f"New topic offered to {target or 'the room'}.",
+            severity="info"
+        )
+
+        # A topic just delivered is itself the intervention; restarting the window keeps
+        # the next automatic one a full window away.
+        self.silence_monitor.note_activity(channel)
+
+        return {
+            "topic_title": topic_title,
+            "prompt": prompt,
+            "inactive_speaker": target,
+            "spoken_response": result.get("spoken_response", "")
+        }
+
+    def start_silence_watcher(self) -> bool:
+        """
+        Starts the background poller that trips the silence rotation (REQ-27).
+
+        Algorithm:
+        1. Honour `ECHOSPHERE_SILENCE_WATCHER=0`, and never start a second thread.
+        2. Run a daemon loop that checks every watched channel on a fixed tick.
+
+        A poller rather than a per-channel timer: `claim()` is already one-shot, so the
+        tick rate only decides how promptly a stalled room is noticed, not how many
+        topics it gets. Started lazily from the first session rather than at import,
+        because importing this module must not start a thread - the test suite imports it
+        to drive `check_silence` on a hand-advanced clock, and a real thread racing that
+        would make an automatic facilitator into an intermittent one.
+        """
+        if os.getenv("ECHOSPHERE_SILENCE_WATCHER", "1").strip() in ("0", "false", "False"):
+            return False
+
+        with self._silence_watcher_lock:
+            if self._silence_watcher is not None and self._silence_watcher.is_alive():
+                return True
+
+            interval = max(5.0, self.silence_monitor.silence_seconds / 4)
+
+            def watch() -> None:
+                while True:
+                    time.sleep(interval)
+                    for channel in self.silence_monitor.watched_channels():
+                        try:
+                            self.check_silence(channel)
+                        except Exception as exc:
+                            # One channel's failed generation must not end the loop and
+                            # silently disable facilitation for every other room.
+                            logger.warning(
+                                f"Silence check failed for channel '{channel}': {exc}"
+                            )
+
+            self._silence_watcher = threading.Thread(
+                target=watch, name="echosphere-silence-watcher", daemon=True
+            )
+            self._silence_watcher.start()
+
+        logger.info(
+            f"REQ-27 silence watcher started "
+            f"(window {self.silence_monitor.silence_seconds}s, tick {interval}s)."
+        )
+        return True
+
+    def check_silence(self, channel: str) -> Optional[Dict[str, Any]]:
+        """
+        Rotates the topic if this channel has been quiet for the full window (REQ-27).
+
+        Returns the published topic, or `None` when the room is still talking, is inside
+        the window, or has no live session at all. Safe to call on a fast poll: the
+        monitor's `claim()` is one-shot, so a room that stays quiet gets one topic rather
+        than one per tick.
+        """
+        if not self.silence_monitor.claim(channel):
+            return None
+
+        logger.info(
+            f"REQ-27 silence window elapsed on channel '{channel}'; "
+            f"generating a topic."
+        )
+        return self.generate_topic(channel)
 
     def _broadcast_turn_payloads(
         self,
@@ -974,6 +1146,11 @@ def api_start_session():
     # from silence rather than inheriting the previous pair's speaking balance.
     server_instance.speaking_balance.reset(channel)
 
+    # REQ-27: the window is armed from the session's start rather than from zero, so a
+    # brand-new session is not declared stalled before anyone has had a chance to speak.
+    server_instance.silence_monitor.start(channel)
+    server_instance.start_silence_watcher()
+
     success = server_instance.start_session()
     return jsonify({
         "success": success,
@@ -998,6 +1175,9 @@ def api_stop_session():
     # REQ-CAM-01: a buffered frame belongs to the conversation it was pushed during, and
     # nothing may look through a camera whose session has ended.
     server_instance.camera_buffer.clear(channel)
+
+    # REQ-27: an ended session's channel is no longer facilitated.
+    server_instance.silence_monitor.stop(channel)
 
     closed = server_instance.sessions.end_session(channel)
     if closed is not None:
@@ -1094,6 +1274,38 @@ def api_report_speaking_time():
         "session_id": meta["session_id"],
         "speaker_percentages": percentages,
         "total_ms": server_instance.speaking_balance.total_ms(channel)
+    }), 200
+
+
+@app.route("/api/session/topic/generate", methods=["POST"])
+def api_generate_topic():
+    """
+    Generates and publishes one conversation topic on demand (REQ-27).
+
+    This is the manual half of the automatic rotation, and deliberately the *same*
+    generator: "Generate Topics" used to cycle a four-item frontend fixture, so the topic
+    a participant asked for and the topic the co-teacher offered on its own came from two
+    unrelated sources. One endpoint keeps them one feature.
+
+    Governed like every other session endpoint (REQ-16): a topic is published to
+    everybody in the room, and an ungoverned endpoint lets a stranger address it.
+    """
+    meta, _, error = _resolve_governed_session()
+    if error:
+        return error
+
+    body = request.get_json(silent=True) or {}
+    channel = meta.get("channel") or server_instance.channel_name
+    topic = server_instance.generate_topic(
+        channel,
+        inactive_speaker=str(body.get("inactive_speaker") or "").strip() or None
+    )
+
+    return jsonify({
+        "success": True,
+        "channel": channel,
+        "session_id": meta["session_id"],
+        "topic": topic
     }), 200
 
 

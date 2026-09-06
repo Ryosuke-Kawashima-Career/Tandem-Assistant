@@ -55,6 +55,12 @@ os.environ["CONVOAI_LLM_BASE_URL"] = "http://localhost:8000"
 os.environ["ECHOSPHERE_DATA_DIR"] = tempfile.mkdtemp(prefix="echosphere-test-artifacts-")
 os.environ["ECHOSPHERE_ARTIFACT_RETENTION_DAYS"] = ""
 
+# REQ-27's silence watcher is a real background thread on a real clock. The suite drives
+# `check_silence` directly on a hand-advanced clock, and a live poller racing that turns
+# an automatic facilitator into an intermittent one - so it stays off here. The behavior
+# it drives is covered by calling `check_silence` explicitly, which is the same code path.
+os.environ["ECHOSPHERE_SILENCE_WATCHER"] = "0"
+
 os.environ["ECHOSPHERE_ENGINE"] = "mock"
 os.environ["OPENAI_API_KEY"] = ""
 os.environ["GEMINI_API_KEY"] = ""

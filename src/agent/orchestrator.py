@@ -1340,6 +1340,10 @@ class TeachingAgent:
         """Generates structured mock silence breaker payload."""
         speaker_target = inactive_speaker or "everyone"
         return {
+            # Mirrors the extra field `create_silence_breaker_prompt` asks a live model
+            # for: the topic card wants a heading, not the question repeated as its own
+            # title.
+            "topic_title": topic,
             "spoken_response": f"Let's explore {topic}! {speaker_target}, what is your favorite tradition related to this?",
             "spoken_language": "en",
             "subtitles": {

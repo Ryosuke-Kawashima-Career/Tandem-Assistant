@@ -129,6 +129,10 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  /* 16.4: the tool row lives in this header now, so the whole set has to be able to
+     fall onto more than one line rather than squeezing controls out of reach. */
+  flex-wrap: wrap;
+  row-gap: 10px;
   background: var(--macos-surface-acrylic);
   backdrop-filter: var(--macos-blur-dock);
   -webkit-backdrop-filter: var(--macos-blur-dock);
@@ -165,7 +169,21 @@ body {
 .macos-header-status {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
+}
+
+/* 16.4: the former .macos-pill-toolbar contents, as a full-width row inside the one
+   header. Separated by a hairline rather than by a second floating bar - the tools are
+   peers of the session controls, not a tier below them. */
+.macos-header-tools {
+  flex: 1 0 100%;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--macos-border-subtle);
 }
 
 .status-dot {
@@ -186,26 +204,8 @@ body {
 /* ==========================================================================
    4. Floating Pill Capsule Toolbars & Segmented Controls
    ========================================================================== */
-.macos-toolbar-container {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 12px;
-  flex-shrink: 0;
-}
-
-.macos-pill-toolbar {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 10px;
-  background: var(--macos-surface-acrylic);
-  backdrop-filter: var(--macos-blur-dock);
-  -webkit-backdrop-filter: var(--macos-blur-dock);
-  border: 1px solid var(--macos-border-subtle);
-  border-radius: 9999px;
-  box-shadow: var(--macos-shadow-dock), var(--macos-inner-glow);
-}
+/* 16.4 removed .macos-toolbar-container / .macos-pill-toolbar: the floating pill bar
+   they styled no longer exists - its controls moved into .macos-header-tools above. */
 
 .macos-segmented-control {
   display: inline-flex;
@@ -555,8 +555,24 @@ body {
   gap: 6px;
 }
 
-.peer-role {
+/* 16.6: one line explaining the gauge, in place of the per-peer bio fixtures. */
+.balance-explainer {
+  margin: 0;
   font-size: 12px;
+  line-height: 1.4;
+  color: var(--macos-text-secondary);
+}
+
+/* 16.3: the session's mode, stated under the subtitles heading. Read-only by design. */
+.subtitles-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.session-agenda {
+  font-size: 11px;
+  font-weight: 500;
   color: var(--macos-text-secondary);
 }
 
@@ -957,6 +973,19 @@ body {
   border: 1px solid var(--macos-border-subtle);
   font-size: 13px;
   margin-bottom: 14px;
+}
+
+/* 16.2: the Join-time mode chooser. Stacked rather than side-by-side so each option
+   reads as a decision about the session, not as OK/Cancel. */
+.modal-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.modal-choices .mode-choice {
+  justify-content: center;
+  width: 100%;
 }
 
 .modal-actions {
